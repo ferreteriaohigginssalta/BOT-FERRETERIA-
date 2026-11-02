@@ -39,7 +39,6 @@ def webhook_whatsapp():
         # Verificación del Webhook con Meta
         verify_token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        # Coloca aquí tu token de verificación si lo usas
         return challenge, 200
 
     if request.method == "POST":
@@ -97,6 +96,19 @@ def panel():
     if not_logueado():
         return pagina_login(), 200
     return PANEL_HTML, 200
+
+# Rutas agregadas para que el panel no tire error 404
+@app.route("/api/conversaciones/<numero>", methods=["GET"])
+def obtener_conversacion(numero):
+    """Devuelve el historial de un chat específico para el panel"""
+    if numero in historial_conversaciones:
+        return json.dumps(historial_conversaciones[numero], ensure_ascii=False), 200
+    return json.dumps([], ensure_ascii=False), 200
+
+@app.route("/api/devolver_bot", methods=["POST"])
+def devolver_bot():
+    """Endpoint auxiliar para el panel"""
+    return {"status": "ok"}, 200
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
