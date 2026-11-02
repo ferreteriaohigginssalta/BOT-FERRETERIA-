@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web con soporte multimedia (Fotos, PDFs, Audios).
+Bot de WhatsApp de la ferretería + panel web con agenda de nombres de clientes.
 """
 
 import html
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
 
 import requests
-from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from flask import Flask, jsonify, redirect, request, session
 
 app = Flask(__name__)
 
@@ -22,7 +22,6 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 
-# Configuración de carpeta para archivos multimedia (imágenes, PDFs, audios)
 UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -55,18 +54,15 @@ PALABRAS_VENDEDOR = (
     "operador", "hablar con alguien",
 )
 
-TZ_AR = timezone(timedelta(hours=-3))  # Argentina
+TZ_AR = timezone(timedelta(hours=-3))
 MAX_CONVERSACIONES = 200
 MAX_MENSAJES = 200
 
 LOCK = threading.Lock()
 CONVERSACIONES = OrderedDict()  # numero -> datos de la conversación
-VISTOS = OrderedDict()  # ids de mensajes de Meta ya procesados
+VISTOS = OrderedDict()
 
 
-# ---------------------------------------------------------------
-# Utilidades y Multimedia (Fotos, PDFs, Audios)
-# ---------------------------------------------------------------
 def ahora():
     return datetime.now(TZ_AR)
 
@@ -84,6 +80,7 @@ def conversacion(numero):
     if c is None:
         c = {
             "numero": numero,
+            "nombre": "",  # <- Aquí guardaremos el nombre personalizado del cliente
             "mensajes": [],
             "humano": False,
             "pide_vendedor": False,
@@ -124,11 +121,9 @@ def descargar_multimedia_whatsapp(media_id, tipo_archivo, whatsapp_token):
         media_url = r.json().get("url")
         
         if not media_url:
-            return None
+            return None, None
 
         file_data = requests.get(media_url, headers=headers).content
-        
-        # Extensiones según el tipo de archivo recibido
         ext = "jpg"
         if tipo_archivo == "document":
             ext = "pdf"
@@ -147,9 +142,6 @@ def descargar_multimedia_whatsapp(media_id, tipo_archivo, whatsapp_token):
         return None, None
 
 
-# ---------------------------------------------------------------
-# Lógica del bot
-# ---------------------------------------------------------------
 def pide_vendedor(texto):
     t = normalizar(texto)
     return any(p in t for p in PALABRAS_VENDEDOR)
@@ -189,7 +181,6 @@ def enviar_whatsapp(numero, texto):
             detalle = f"Meta respondió {r.status_code}"
         return False, detalle
     except Exception as e:
-        print("ERROR AL ENVIAR A WHATSAPP:", repr(e))
         return False, "No se pudo conectar con WhatsApp"
 
 
@@ -232,7 +223,6 @@ def procesar_mensaje(msg):
         texto = "[Archivo no compatible]"
         es_texto = False
 
-    print(f"Mensaje de {numero}: {texto[:40]}")
     agregar(numero, "cliente", texto)
 
     with LOCK:
@@ -252,9 +242,6 @@ def procesar_mensaje(msg):
         responder_como_bot(numero, armar_respuesta(texto))
 
 
-# ---------------------------------------------------------------
-# Webhook de Meta
-# ---------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def inicio():
     return "Bot activo", 200
@@ -282,9 +269,6 @@ def recibir():
     return "ok", 200
 
 
-# ---------------------------------------------------------------
-# Acceso al panel (clave + sesión)
-# ---------------------------------------------------------------
 INTENTOS = {}
 
 
@@ -361,9 +345,6 @@ def sin_cache(resp):
     return resp
 
 
-# ---------------------------------------------------------------
-# API del panel y Descarga de Archivos
-# ---------------------------------------------------------------
 @app.route("/api/conversaciones", methods=["GET"])
 def api_conversaciones():
     if not logueado():
@@ -378,9 +359,15 @@ def api_conversaciones():
             elif "PDF" in texto_preview:
                 texto_preview = "[Documento PDF]"
             elif "Audio" in texto_preview:
-                texto_preview = "[Audio / Nota de voz]"
+                texto_preview = "[Audio]"
+            
+            # Mostrar nombre personalizado si lo tiene, sino el número
+            titulo_mostrar = c["nombre"] if c["nombre"] else "+" + c["numero"]
+            
             items.append({
                 "numero": c["numero"],
+                "nombre": c["nombre"],
+                "titulo": titulo_mostrar,
                 "texto": texto_preview[:70],
                 "hora": ultimo["hora"],
                 "no_leidos": c["no_leidos"],
@@ -407,10 +394,27 @@ def api_conversacion(numero):
         c["no_leidos"] = 0
         return jsonify({
             "numero": numero,
+            "nombre": c["nombre"],
             "mensajes": list(c["mensajes"]),
             "humano": c["humano"],
             "pide_vendedor": c["pide_vendedor"],
         }), 200
+
+
+@app.route("/api/guardar_nombre", methods=["POST"])
+def api_guardar_nombre():
+    if not logueado():
+        return jsonify({"error": "no autorizado"}), 401
+    data = request.get_json(silent=True) or {}
+    numero = str(data.get("numero", ""))
+    nombre = str(data.get("nombre", "")).strip()
+    if not numero_valido(numero):
+        return jsonify({"ok": False, "error": "Número inválido"}), 400
+    with LOCK:
+        c = CONVERSACIONES.get(numero)
+        if c is not None:
+            c["nombre"] = nombre
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/api/enviar", methods=["POST"])
@@ -456,9 +460,7 @@ def api_enviar_imagen():
     if num_envio.startswith("549"):
         num_envio = "54" + num_envio[3:]
         
-    # Validar si es PDF o Imagen para mandar el tipo correcto a Meta
     es_pdf = archivo.filename.lower().endswith('.pdf')
-    tipo_meta = "document" if es_pdf else "image"
     
     url_meta = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -562,6 +564,8 @@ header a{color:#fff;font-size:14px}
 button{border:0;border-radius:8px;padding:8px 14px;background:#075e54;color:#fff;font:inherit;cursor:pointer}
 button.sec{background:#667}
 button:disabled{opacity:.5}
+#nombre-box{display:flex;gap:6px;align-items:center;margin-left:10px}
+#inputNombre{padding:4px 8px;border:1px solid #ccc;border-radius:6px;font-size:13px}
 @media(max-width:700px){
  #lista{width:100%}
  #main.abierto #lista{display:none}
@@ -576,7 +580,11 @@ button:disabled{opacity:.5}
   <div id="cab">
    <button class="sec atras" id="atras">←</button>
    <strong id="titulo"></strong>
-   <span id="estado"></span>
+   <div id="nombre-box">
+     <input type="text" id="inputNombre" placeholder="Poner nombre al cliente...">
+     <button class="sec" onclick="guardarNombre()">Guardar</button>
+   </div>
+   <span id="estado" style="margin-left:auto"></span>
    <button class="sec" id="devolver" style="display:none">Devolver al bot</button>
   </div>
   <div id="msgs"><div class="vacio" id="vacio">Elegí una conversación de la lista.</div></div>
@@ -619,7 +627,7 @@ async function cargarLista() {
   data.forEach(c => {
     const item = el("div", "item" + (c.pide_vendedor ? " pide" : "") + (c.numero === actual ? " sel" : ""));
     const f1 = el("div", "fila");
-    const izq = el("span", "num", "+" + c.numero);
+    const izq = el("span", "num", c.titulo);
     if (c.no_leidos) izq.appendChild(el("span", "badge", String(c.no_leidos)));
     f1.appendChild(izq);
     f1.appendChild(el("span", "hora", c.hora));
@@ -645,9 +653,10 @@ async function cargarChat(forzar) {
   const d = await api("/api/conversaciones/" + actual);
   if (d.numero !== actual) return;
   $("titulo").textContent = "+" + d.numero;
+  $("inputNombre").value = d.nombre || "";
   $("estado").textContent = d.humano ? "👤 Atiende una persona" : "🤖 Atiende el bot";
   $("devolver").style.display = d.humano ? "inline-block" : "none";
-  const clave = d.mensajes.length + "|" + d.humano;
+  const clave = d.mensajes.length + "|" + d.humano + "|" + d.nombre;
   if (!forzar && clave === ultimaClave) return;
   ultimaClave = clave;
   const box = $("msgs");
@@ -668,6 +677,27 @@ async function cargarChat(forzar) {
     box.appendChild(b);
   });
   if (abajo || forzar) box.scrollTop = box.scrollHeight;
+}
+
+async function guardarNombre() {
+  if (!actual) return;
+  const nuevoNombre = $("inputNombre").value.trim();
+  try {
+    const r = await fetch("/api/guardar_nombre", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ numero: actual, nombre: nuevoNombre })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      await cargarChat(true);
+      await cargarLista();
+    } else {
+      alert("No se pudo guardar el nombre.");
+    }
+  } catch (e) {
+    alert("Error de conexión.");
+  }
 }
 
 async function enviar() {
