@@ -70,7 +70,7 @@ def webhook_whatsapp():
         except Exception as e:
             print(f"Error procesando el webhook: {e}")
 
-        return "EVENT_RECEIVED", 200
+    return "OK", 200
 
 # HTML básico para el panel de control interno
 PANEL_HTML = """
