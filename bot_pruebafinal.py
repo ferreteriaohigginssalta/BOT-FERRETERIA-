@@ -1,12 +1,12 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores.
+Bot de WhatsApp de la ferretería + panel web para vendedores con soporte multimedia.
 
 Variables de entorno que hay que cargar en Render (pestaña Environment):
-    WHATSAPP_TOKEN    token de Meta (el permanente)
-    PHONE_NUMBER_ID   Phone Number ID del número del bot
-    VERIFY_TOKEN      la clave que pusiste en el webhook de Meta
-    PANEL_PASSWORD    clave para entrar al panel de vendedores (NUEVA)
-    SECRET_KEY        texto largo al azar, para las sesiones (NUEVA, opcional)
+    WHATSAPP_TOKEN     token de Meta (el permanente)
+    PHONE_NUMBER_ID    Phone Number ID del número del bot
+    VERIFY_TOKEN       la clave que pusiste en el webhook de Meta
+    PANEL_PASSWORD     clave para entrar al panel de vendedores
+    SECRET_KEY         texto largo al azar, para las sesiones
 """
 
 import html
@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
 
 import requests
-from flask import Flask, jsonify, redirect, request, session
+from flask import Flask, jsonify, redirect, request, session, url_for
 
 app = Flask(__name__)
 
@@ -28,6 +28,10 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
+
+# Configuración de carpeta para archivos multimedia (imágenes)
+UPLOAD_FOLDER = 'static/uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.permanent_session_lifetime = timedelta(hours=12)
@@ -58,7 +62,7 @@ PALABRAS_VENDEDOR = (
     "operador", "hablar con alguien",
 )
 
-TZ_AR = timezone(timedelta(hours=-3))  # Argentina no usa horario de verano
+TZ_AR = timezone(timedelta(hours=-3))  # Argentina
 MAX_CONVERSACIONES = 200
 MAX_MENSAJES = 200
 
@@ -68,14 +72,13 @@ VISTOS = OrderedDict()  # ids de mensajes de Meta ya procesados
 
 
 # ---------------------------------------------------------------
-# Utilidades
+# Utilidades y Multimedia
 # ---------------------------------------------------------------
 def ahora():
     return datetime.now(TZ_AR)
 
 
 def normalizar(texto):
-    """Minúsculas y sin tildes: 'Horários' -> 'horarios'."""
     texto = texto.lower().strip()
     return "".join(
         c for c in unicodedata.normalize("NFD", texto)
@@ -84,7 +87,6 @@ def normalizar(texto):
 
 
 def conversacion(numero):
-    """Devuelve (creando si hace falta) la conversación. Llamar con LOCK."""
     c = CONVERSACIONES.get(numero)
     if c is None:
         c = {
@@ -102,7 +104,6 @@ def conversacion(numero):
 
 
 def agregar(numero, quien, texto):
-    """quien: 'cliente', 'bot' o 'vendedor'."""
     with LOCK:
         c = conversacion(numero)
         t = ahora()
@@ -120,6 +121,29 @@ def agregar(numero, quien, texto):
 
 def numero_valido(numero):
     return numero.isdigit() and 8 <= len(numero) <= 20
+
+
+def descargar_imagen_whatsapp(media_id, whatsapp_token):
+    try:
+        headers = {"Authorization": f"Bearer {whatsapp_token}"}
+        url_media = f"https://graph.facebook.com/v21.0/{media_id}"
+        r = requests.get(url_media, headers=headers)
+        media_url = r.json().get("url")
+        
+        if not media_url:
+            return None
+
+        img_data = requests.get(media_url, headers=headers).content
+        nombre_archivo = f"{media_id}.jpg"
+        ruta_guardado = os.path.join(UPLOAD_FOLDER, nombre_archivo)
+        
+        with open(ruta_guardado, "wb") as f:
+            f.write(img_data)
+            
+        return f"/static/uploads/{nombre_archivo}"
+    except Exception as e:
+        print("Error descargando imagen:", e)
+        return None
 
 
 # ---------------------------------------------------------------
@@ -140,8 +164,6 @@ def armar_respuesta(texto):
 
 
 def enviar_whatsapp(numero, texto):
-    """Devuelve (ok, detalle_del_error)."""
-    # Argentina: Meta manda 549..., pero para responder va sin el 9
     if numero.startswith("549"):
         numero = "54" + numero[3:]
 
@@ -181,25 +203,39 @@ def procesar_mensaje(msg):
     with LOCK:
         if mid:
             if mid in VISTOS:
-                return  # Meta reenvió el mismo mensaje
+                return
             VISTOS[mid] = True
             while len(VISTOS) > 1000:
                 VISTOS.popitem(last=False)
 
     numero = msg["from"]
-    es_texto = msg.get("type") == "text"
-    texto = msg["text"]["body"] if es_texto else ""
-    print(f"Mensaje de {numero}: {texto or '[no es texto]'}")
+    tipo_msg = msg.get("type")
+    
+    if tipo_msg == "text":
+        texto = msg["text"]["body"]
+        es_texto = True
+    elif tipo_msg == "image":
+        media_id = msg["image"]["id"]
+        url_imagen = descargar_imagen_whatsapp(media_id, WHATSAPP_TOKEN)
+        if url_imagen:
+            texto = f'<img src="{url_imagen}" style="max-width:220px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)">'
+        else:
+            texto = "[Imagen recibida]"
+        es_texto = True
+    else:
+        texto = "[Archivo multimedia]"
+        es_texto = False
 
-    agregar(numero, "cliente", texto if es_texto else "[foto, audio u otro archivo]")
+    print(f"Mensaje de {numero}: {texto}")
+    agregar(numero, "cliente", texto)
 
     with LOCK:
         humano = conversacion(numero)["humano"]
     if humano:
-        return  # atiende una persona: el bot se queda callado
+        return
 
     if not es_texto:
-        responder_como_bot(numero, f"Por ahora solo leo texto 🙂\n{MENU}")
+        responder_como_bot(numero, f"Por ahora solo texto e imágenes 🙂\n{MENU}")
     elif pide_vendedor(texto):
         with LOCK:
             c = conversacion(numero)
@@ -243,7 +279,7 @@ def recibir():
 # ---------------------------------------------------------------
 # Acceso al panel (clave + sesión)
 # ---------------------------------------------------------------
-INTENTOS = {}  # ip -> (fallos, desde cuándo)
+INTENTOS = {}
 
 
 def ip_cliente():
@@ -320,7 +356,7 @@ def sin_cache(resp):
 
 
 # ---------------------------------------------------------------
-# API del panel (todas exigen sesión iniciada)
+# API del panel
 # ---------------------------------------------------------------
 @app.route("/api/conversaciones", methods=["GET"])
 def api_conversaciones():
@@ -330,9 +366,12 @@ def api_conversaciones():
         items = []
         for c in CONVERSACIONES.values():
             ultimo = c["mensajes"][-1] if c["mensajes"] else {"texto": "", "hora": ""}
+            texto_preview = ultimo["texto"]
+            if "<img" in texto_preview:
+                texto_preview = "[Imagen]"
             items.append({
                 "numero": c["numero"],
-                "texto": ultimo["texto"][:70],
+                "texto": texto_preview[:70],
                 "hora": ultimo["hora"],
                 "no_leidos": c["no_leidos"],
                 "humano": c["humano"],
@@ -381,9 +420,58 @@ def api_enviar():
     agregar(numero, "vendedor", texto)
     with LOCK:
         c = conversacion(numero)
-        c["humano"] = True        # a partir de acá el bot no interviene
-        c["pide_vendedor"] = False  # ya lo están atendiendo
+        c["humano"] = True
+        c["pide_vendedor"] = False
     return jsonify({"ok": True}), 200
+
+
+@app.route("/api/enviar_imagen", methods=["POST"])
+def api_enviar_imagen():
+    if not logueado():
+        return jsonify({"error": "no autorizado"}), 401
+    
+    numero = str(request.form.get("numero", ""))
+    archivo = request.files.get("imagen")
+    
+    if not numero_valido(numero) or not archivo:
+        return jsonify({"ok": False, "error": "Faltan datos"}), 400
+        
+    nombre_archivo = f"enviada_{int(time.time())}_{archivo.filename}"
+    ruta_fisica = os.path.join(UPLOAD_FOLDER, nombre_archivo)
+    archivo.save(ruta_fisica)
+    
+    url_publica = request.host_url.rstrip('/') + f"/static/uploads/{nombre_archivo}"
+    
+    num_envio = numero
+    if num_envio.startswith("549"):
+        num_envio = "54" + num_envio[3:]
+        
+    url_meta = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": num_envio,
+        "type": "image",
+        "image": {"link": url_publica}
+    }
+    
+    try:
+        r = requests.post(url_meta, json=payload, headers=headers, timeout=15)
+        if not r.ok:
+            return jsonify({"ok": False, "error": "Error al enviar imagen por Meta"}), 502
+    except Exception:
+        return jsonify({"ok": False, "error": "No se pudo conectar con WhatsApp"}), 502
+        
+    texto_html = f'<img src="{url_publica}" style="max-width:220px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)">'
+    agregar(numero, "vendedor", texto_html)
+    with LOCK:
+        c = conversacion(numero)
+        c["humano"] = True
+        c["pide_vendedor"] = False
+    return jsonify({"ok": True, "url": url_publica}), 200
 
 
 @app.route("/api/devolver_bot", methods=["POST"])
@@ -441,8 +529,9 @@ header a{color:#fff;font-size:14px}
 .cliente{background:#fff;align-self:flex-start}
 .bot{background:#d9edff;align-self:flex-end}
 .vendedor{background:#dcf8c6;align-self:flex-end}
-#form{gap:8px;padding:10px;background:#f0f2f5}
+#form{gap:8px;padding:10px;background:#f0f2f5;align-items:center}
 #texto{flex:1;resize:none;border:1px solid #ccc;border-radius:8px;padding:8px;font:inherit;height:44px}
+.btn-attach{cursor:pointer;font-size:22px;padding:0 6px;display:flex;align-items:center}
 button{border:0;border-radius:8px;padding:8px 14px;background:#075e54;color:#fff;font:inherit;cursor:pointer}
 button.sec{background:#667}
 button:disabled{opacity:.5}
@@ -465,6 +554,7 @@ button:disabled{opacity:.5}
   </div>
   <div id="msgs"><div class="vacio" id="vacio">Elegí una conversación de la lista.</div></div>
   <div id="form">
+   <label class="btn-attach" title="Enviar foto">📎<input type="file" id="inputFoto" accept="image/*" style="display:none" onchange="enviarImagen()"></label>
    <textarea id="texto" placeholder="Escribí tu respuesta..."></textarea>
    <button id="enviar">Enviar</button>
   </div>
@@ -540,7 +630,13 @@ async function cargarChat(forzar) {
   d.mensajes.forEach(m => {
     const b = el("div", "msg " + m.quien);
     b.appendChild(el("span", "etq", nombres[m.quien] || m.quien));
-    b.appendChild(document.createTextNode(m.texto));
+    const contenido = el("div", "", "");
+    if (m.texto.includes("<img")) {
+        contenido.innerHTML = m.texto;
+    } else {
+        contenido.textContent = m.texto;
+    }
+    b.appendChild(contenido);
     b.appendChild(el("small", "", m.hora));
     box.appendChild(b);
   });
@@ -565,6 +661,28 @@ async function enviar() {
     alert("Error de conexión. Probá de nuevo.");
   }
   $("enviar").disabled = false;
+  await cargarChat(true).catch(() => {});
+  cargarLista().catch(() => {});
+}
+
+async function enviarImagen() {
+  const input = $("inputFoto");
+  if (!input.files.length || !actual) return;
+  const formData = new FormData();
+  formData.append("numero", actual);
+  formData.append("imagen", input.files[0]);
+  try {
+    const r = await fetch("/api/enviar_imagen", {
+      method: "POST",
+      body: formData
+    });
+    if (r.status === 401) { location.href = "/panel"; return; }
+    const d = await r.json();
+    if (!d.ok) { alert("Error al enviar imagen: " + (d.error || "desconocido")); }
+  } catch (e) {
+    alert("Error de conexión al enviar la foto.");
+  }
+  input.value = "";
   await cargarChat(true).catch(() => {});
   cargarLista().catch(() => {});
 }
@@ -609,5 +727,4 @@ def panel():
 
 
 if __name__ == "__main__":
-    # Solo para probar en tu compu. En Render se usa gunicorn.
     app.run(port=5000, debug=True)
