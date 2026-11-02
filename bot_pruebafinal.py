@@ -1,12 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores con soporte multimedia.
-
-Variables de entorno que hay que cargar en Render (pestaña Environment):
-    WHATSAPP_TOKEN     token de Meta (el permanente)
-    PHONE_NUMBER_ID    Phone Number ID del número del bot
-    VERIFY_TOKEN       la clave que pusiste en el webhook de Meta
-    PANEL_PASSWORD     clave para entrar al panel de vendedores
-    SECRET_KEY         texto largo al azar, para las sesiones
+Bot de WhatsApp de la ferretería + panel web con soporte multimedia (Fotos, PDFs, Audios).
 """
 
 import html
@@ -20,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
 
 import requests
-from flask import Flask, jsonify, redirect, request, session, url_for
+from flask import Flask, jsonify, redirect, request, send_from_directory, session
 
 app = Flask(__name__)
 
@@ -29,7 +22,7 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 
-# Configuración de carpeta para archivos multimedia (imágenes)
+# Configuración de carpeta para archivos multimedia (imágenes, PDFs, audios)
 UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -72,7 +65,7 @@ VISTOS = OrderedDict()  # ids de mensajes de Meta ya procesados
 
 
 # ---------------------------------------------------------------
-# Utilidades y Multimedia
+# Utilidades y Multimedia (Fotos, PDFs, Audios)
 # ---------------------------------------------------------------
 def ahora():
     return datetime.now(TZ_AR)
@@ -123,7 +116,7 @@ def numero_valido(numero):
     return numero.isdigit() and 8 <= len(numero) <= 20
 
 
-def descargar_imagen_whatsapp(media_id, whatsapp_token):
+def descargar_multimedia_whatsapp(media_id, tipo_archivo, whatsapp_token):
     try:
         headers = {"Authorization": f"Bearer {whatsapp_token}"}
         url_media = f"https://graph.facebook.com/v21.0/{media_id}"
@@ -133,17 +126,25 @@ def descargar_imagen_whatsapp(media_id, whatsapp_token):
         if not media_url:
             return None
 
-        img_data = requests.get(media_url, headers=headers).content
-        nombre_archivo = f"{media_id}.jpg"
+        file_data = requests.get(media_url, headers=headers).content
+        
+        # Extensiones según el tipo de archivo recibido
+        ext = "jpg"
+        if tipo_archivo == "document":
+            ext = "pdf"
+        elif tipo_archivo in ["audio", "voice"]:
+            ext = "ogg"
+
+        nombre_archivo = f"{media_id}.{ext}"
         ruta_guardado = os.path.join(UPLOAD_FOLDER, nombre_archivo)
         
         with open(ruta_guardado, "wb") as f:
-            f.write(img_data)
+            f.write(file_data)
             
-        return f"/static/uploads/{nombre_archivo}"
+        return f"/static/uploads/{nombre_archivo}", ext
     except Exception as e:
-        print("Error descargando imagen:", e)
-        return None
+        print("Error descargando multimedia:", e)
+        return None, None
 
 
 # ---------------------------------------------------------------
@@ -180,7 +181,6 @@ def enviar_whatsapp(numero, texto):
     }
     try:
         r = requests.post(url, headers=headers, json=data, timeout=15)
-        print("ENVIO -> Código:", r.status_code, "| Respuesta Meta:", r.text)
         if r.ok:
             return True, ""
         try:
@@ -214,19 +214,25 @@ def procesar_mensaje(msg):
     if tipo_msg == "text":
         texto = msg["text"]["body"]
         es_texto = True
-    elif tipo_msg == "image":
-        media_id = msg["image"]["id"]
-        url_imagen = descargar_imagen_whatsapp(media_id, WHATSAPP_TOKEN)
-        if url_imagen:
-            texto = f'<img src="{url_imagen}" style="max-width:220px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)">'
+    elif tipo_msg in ["image", "document", "audio", "voice"]:
+        media_id = msg[tipo_msg]["id"]
+        url_archivo, ext = descargar_multimedia_whatsapp(media_id, tipo_msg, WHATSAPP_TOKEN)
+        
+        if url_archivo:
+            if ext == "jpg":
+                texto = f'<div style="margin-bottom:4px;"><img src="{url_archivo}" style="max-width:220px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)"></div><a href="{url_archivo}" download style="font-size:12px; color:#075e54; text-decoration:underline; font-weight:bold;">📥 Descargar Imagen</a>'
+            elif ext == "pdf":
+                texto = f'📄 <b>Documento PDF recibido</b><br><a href="{url_archivo}" download style="display:inline-block; margin-top:6px; padding:6px 10px; background:#075e54; color:#fff; border-radius:6px; text-decoration:none; font-size:13px;">📥 Descargar Archivo PDF</a>'
+            else:
+                texto = f'🎙️ <b>Nota de voz / Audio</b><br><audio controls style="max-width:220px; margin-top:5px;"><source src="{url_archivo}" type="audio/ogg"></audio><br><a href="{url_archivo}" download style="font-size:12px; color:#075e54; text-decoration:underline;">📥 Descargar Audio</a>'
         else:
-            texto = "[Imagen recibida]"
+            texto = "[Archivo multimedia recibido]"
         es_texto = True
     else:
-        texto = "[Archivo multimedia]"
+        texto = "[Archivo no compatible]"
         es_texto = False
 
-    print(f"Mensaje de {numero}: {texto}")
+    print(f"Mensaje de {numero}: {texto[:40]}")
     agregar(numero, "cliente", texto)
 
     with LOCK:
@@ -235,7 +241,7 @@ def procesar_mensaje(msg):
         return
 
     if not es_texto:
-        responder_como_bot(numero, f"Por ahora solo texto e imágenes 🙂\n{MENU}")
+        responder_como_bot(numero, f"Recibí tu archivo 🙂\n{MENU}")
     elif pide_vendedor(texto):
         with LOCK:
             c = conversacion(numero)
@@ -356,7 +362,7 @@ def sin_cache(resp):
 
 
 # ---------------------------------------------------------------
-# API del panel
+# API del panel y Descarga de Archivos
 # ---------------------------------------------------------------
 @app.route("/api/conversaciones", methods=["GET"])
 def api_conversaciones():
@@ -369,6 +375,10 @@ def api_conversaciones():
             texto_preview = ultimo["texto"]
             if "<img" in texto_preview:
                 texto_preview = "[Imagen]"
+            elif "PDF" in texto_preview:
+                texto_preview = "[Documento PDF]"
+            elif "Audio" in texto_preview:
+                texto_preview = "[Audio / Nota de voz]"
             items.append({
                 "numero": c["numero"],
                 "texto": texto_preview[:70],
@@ -446,26 +456,43 @@ def api_enviar_imagen():
     if num_envio.startswith("549"):
         num_envio = "54" + num_envio[3:]
         
+    # Validar si es PDF o Imagen para mandar el tipo correcto a Meta
+    es_pdf = archivo.filename.lower().endswith('.pdf')
+    tipo_meta = "document" if es_pdf else "image"
+    
     url_meta = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": num_envio,
-        "type": "image",
-        "image": {"link": url_publica}
-    }
+    
+    if es_pdf:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": num_envio,
+            "type": "document",
+            "document": {"link": url_publica, "filename": archivo.filename}
+        }
+    else:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": num_envio,
+            "type": "image",
+            "image": {"link": url_publica}
+        }
     
     try:
         r = requests.post(url_meta, json=payload, headers=headers, timeout=15)
         if not r.ok:
-            return jsonify({"ok": False, "error": "Error al enviar imagen por Meta"}), 502
+            return jsonify({"ok": False, "error": "Error al enviar archivo por Meta"}), 502
     except Exception:
         return jsonify({"ok": False, "error": "No se pudo conectar con WhatsApp"}), 502
         
-    texto_html = f'<img src="{url_publica}" style="max-width:220px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)">'
+    if es_pdf:
+        texto_html = f'📄 <b>Documento enviado</b><br><a href="{url_publica}" download style="display:inline-block; margin-top:6px; padding:6px 10px; background:#075e54; color:#fff; border-radius:6px; text-decoration:none; font-size:13px;">📥 Descargar PDF</a>'
+    else:
+        texto_html = f'<div style="margin-bottom:4px;"><img src="{url_publica}" style="max-width:220px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)"></div><a href="{url_publica}" download style="font-size:12px; color:#075e54; text-decoration:underline; font-weight:bold;">📥 Descargar Imagen</a>'
+
     agregar(numero, "vendedor", texto_html)
     with LOCK:
         c = conversacion(numero)
@@ -554,7 +581,7 @@ button:disabled{opacity:.5}
   </div>
   <div id="msgs"><div class="vacio" id="vacio">Elegí una conversación de la lista.</div></div>
   <div id="form">
-   <label class="btn-attach" title="Enviar foto">📎<input type="file" id="inputFoto" accept="image/*" style="display:none" onchange="enviarImagen()"></label>
+   <label class="btn-attach" title="Adjuntar Foto o PDF">📎<input type="file" id="inputFoto" accept="image/*,.pdf" style="display:none" onchange="enviarImagen()"></label>
    <textarea id="texto" placeholder="Escribí tu respuesta..."></textarea>
    <button id="enviar">Enviar</button>
   </div>
@@ -631,7 +658,7 @@ async function cargarChat(forzar) {
     const b = el("div", "msg " + m.quien);
     b.appendChild(el("span", "etq", nombres[m.quien] || m.quien));
     const contenido = el("div", "", "");
-    if (m.texto.includes("<img")) {
+    if (m.texto.includes("<img") || m.texto.includes("📄") || m.texto.includes("🎙️")) {
         contenido.innerHTML = m.texto;
     } else {
         contenido.textContent = m.texto;
@@ -678,9 +705,9 @@ async function enviarImagen() {
     });
     if (r.status === 401) { location.href = "/panel"; return; }
     const d = await r.json();
-    if (!d.ok) { alert("Error al enviar imagen: " + (d.error || "desconocido")); }
+    if (!d.ok) { alert("Error al enviar archivo: " + (d.error || "desconocido")); }
   } catch (e) {
-    alert("Error de conexión al enviar la foto.");
+    alert("Error de conexión al enviar el archivo.");
   }
   input.value = "";
   await cargarChat(true).catch(() => {});
