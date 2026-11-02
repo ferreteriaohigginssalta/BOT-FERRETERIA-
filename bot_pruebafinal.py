@@ -1,9 +1,11 @@
 """
-Bot de WhatsApp de la ferretería + panel web con agenda de nombres de clientes.
+Bot de WhatsApp de la ferretería + panel web con agenda de nombres 
+y persistencia en disco (para que no se borren los datos al reiniciarse Render).
 """
 
 import html
 import os
+import json
 import secrets
 import threading
 import time
@@ -24,6 +26,9 @@ PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 
 UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Archivo local para guardar la persistencia de los chats
+DB_FILE = 'datos_ferreteria.json'
 
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.permanent_session_lifetime = timedelta(hours=12)
@@ -63,6 +68,31 @@ CONVERSACIONES = OrderedDict()  # numero -> datos de la conversación
 VISTOS = OrderedDict()
 
 
+# ---------------------------------------------------------------
+# Sistema de Persistencia (Guardar y Cargar en archivo JSON)
+# ---------------------------------------------------------------
+def guardar_datos():
+    try:
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(list(CONVERSACIONES.items()), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Error guardando datos en disco:", e)
+
+def cargar_datos():
+    global CONVERSACIONES
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                CONVERSACIONES = OrderedDict(data)
+                print(f"✅ Datos cargados correctamente: {len(CONVERSACIONES)} conversaciones.")
+        except Exception as e:
+            print("Error cargando datos de disco:", e)
+
+# Cargamos los datos al iniciar la aplicación
+cargar_datos()
+
+
 def ahora():
     return datetime.now(TZ_AR)
 
@@ -80,7 +110,7 @@ def conversacion(numero):
     if c is None:
         c = {
             "numero": numero,
-            "nombre": "",  # <- Aquí guardaremos el nombre personalizado del cliente
+            "nombre": "",
             "mensajes": [],
             "humano": False,
             "pide_vendedor": False,
@@ -107,6 +137,7 @@ def agregar(numero, quien, texto):
         if quien == "cliente":
             c["no_leidos"] += 1
         CONVERSACIONES.move_to_end(numero)
+        guardar_datos()  # Se guarda automáticamente en disco
 
 
 def numero_valido(numero):
@@ -237,6 +268,7 @@ def procesar_mensaje(msg):
             c = conversacion(numero)
             c["humano"] = True
             c["pide_vendedor"] = True
+            guardar_datos()
         responder_como_bot(numero, DERIVACION)
     else:
         responder_como_bot(numero, armar_respuesta(texto))
@@ -361,7 +393,6 @@ def api_conversaciones():
             elif "Audio" in texto_preview:
                 texto_preview = "[Audio]"
             
-            # Mostrar nombre personalizado si lo tiene, sino el número
             titulo_mostrar = c["nombre"] if c["nombre"] else "+" + c["numero"]
             
             items.append({
@@ -392,6 +423,7 @@ def api_conversacion(numero):
         if c is None:
             return jsonify({"error": "no existe"}), 404
         c["no_leidos"] = 0
+        guardar_datos()  # Actualiza el estado de leído en disco
         return jsonify({
             "numero": numero,
             "nombre": c["nombre"],
@@ -414,6 +446,7 @@ def api_guardar_nombre():
         c = CONVERSACIONES.get(numero)
         if c is not None:
             c["nombre"] = nombre
+            guardar_datos()  # Guarda el nombre en disco de inmediato
     return jsonify({"ok": True}), 200
 
 
@@ -436,6 +469,7 @@ def api_enviar():
         c = conversacion(numero)
         c["humano"] = True
         c["pide_vendedor"] = False
+        guardar_datos()
     return jsonify({"ok": True}), 200
 
 
@@ -500,6 +534,7 @@ def api_enviar_imagen():
         c = conversacion(numero)
         c["humano"] = True
         c["pide_vendedor"] = False
+        guardar_datos()
     return jsonify({"ok": True, "url": url_publica}), 200
 
 
@@ -517,6 +552,7 @@ def api_devolver_bot():
             return jsonify({"ok": False, "error": "No existe"}), 404
         c["humano"] = False
         c["pide_vendedor"] = False
+        guardar_datos()
     return jsonify({"ok": True}), 200
 
 
