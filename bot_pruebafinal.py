@@ -36,7 +36,6 @@ def inicio():
 def webhook_whatsapp():
     """Endpoint para recibir y procesar los mensajes de WhatsApp"""
     if request.method == "GET":
-        # Verificación del Webhook con Meta
         verify_token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
         return challenge, 200
@@ -44,7 +43,6 @@ def webhook_whatsapp():
     if request.method == "POST":
         data = request.json
         try:
-            # Procesamiento básico del mensaje entrante
             entry = data.get("entry", [])[0]
             change = entry.get("changes", [])[0]
             value = change.get("value", {})
@@ -55,7 +53,6 @@ def webhook_whatsapp():
                 numero_remitente = msg.get("from")
                 texto_mensaje = msg.get("text", {}).get("body", "")
 
-                # Guardamos o actualizamos el historial en memoria local
                 if numero_remitente not in historial_conversaciones:
                     historial_conversaciones[numero_remitente] = []
 
@@ -64,7 +61,6 @@ def webhook_whatsapp():
                     "remitente": "cliente"
                 })
 
-                # Persistimos inmediatamente en el JSON local
                 guardar_chats_locales(historial_conversaciones)
 
         except Exception as e:
@@ -72,20 +68,80 @@ def webhook_whatsapp():
 
     return "OK", 200
 
-# HTML básico para el panel de control interno
+# HTML y JavaScript funcional para el panel de control
 PANEL_HTML = """
 <!DOCTYPE html>
-<html>
-<head><title>Panel Ferretería</title></head>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Panel Ferretería - Chats</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; display: flex; height: 100vh; background: #f4f4f9; }
+        .sidebar { width: 300px; background: #2c3e50; color: white; overflow-y: auto; padding: 20px; }
+        .sidebar h2 { font-size: 1.2rem; margin-bottom: 20px; }
+        .chat-item { padding: 10px; margin-bottom: 8px; background: #34495e; cursor: pointer; border-radius: 4px; }
+        .chat-item:hover { background: #1abc9c; }
+        .chat-window { flex: 1; display: flex; flex-direction: column; padding: 20px; }
+        .messages { flex: 1; background: white; padding: 20px; border-radius: 8px; overflow-y: auto; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 6px; max-width: 60%; }
+        .msg.cliente { background: #e1f5fe; align-self: flex-start; }
+    </style>
+</head>
 <body>
-    <h1>Panel de Control - Bot de Ferretería</h1>
-    <p>El bot está activo y guardando la persistencia de los chats correctamente.</p>
+    <div class="sidebar">
+        <h2>Chats de Clientes</h2>
+        <div id="lista-chats">Cargando chats...</div>
+    </div>
+    <div class="chat-window">
+        <h2 id="titulo-chat">Seleccioná un chat</h2>
+        <div class="messages" id="contenedor-mensajes"></div>
+    </div>
+
+    <script>
+        async function cargarChats() {
+            try {
+                let res = await fetch('/api/chats');
+                let numeros = await res.json();
+                let contenedor = document.getElementById('lista-chats');
+                contenedor.innerHTML = '';
+                if(numeros.length === 0) {
+                    contenedor.innerHTML = '<p>No hay chats guardados aún.</p>';
+                    return;
+                }
+                numeros.forEach(num => {
+                    let div = document.createElement('div');
+                    div.className = 'chat-item';
+                    div.textContent = 'Cliente: ' + num;
+                    div.onclick = () => cargarConversacion(num);
+                    contenedor.appendChild(div);
+                });
+            } catch(e) {
+                console.error("Error cargando chats", e);
+            }
+        }
+
+        async function cargarConversacion(numero) {
+            document.getElementById('titulo-chat').textContent = 'Chat con: ' + numero;
+            let res = await fetch('/api/conversaciones/' + numero);
+            let mensajes = await res.json();
+            let msgContainer = document.getElementById('contenedor-mensajes');
+            msgContainer.innerHTML = '';
+            mensajes.forEach(m => {
+                let d = document.createElement('div');
+                d.className = 'msg ' + m.remitente;
+                d.textContent = m.mensaje;
+                msgContainer.appendChild(d);
+            });
+        }
+
+        cargarChats();
+        setInterval(cargarChats, 5000); // Actualiza cada 5 segundos
+    </script>
 </body>
 </html>
 """
 
 def not_logueado():
-    # Función auxiliar de autenticación para el panel
     return False
 
 def pagina_login():
@@ -97,17 +153,20 @@ def panel():
         return pagina_login(), 200
     return PANEL_HTML, 200
 
-# Rutas agregadas para que el panel no tire error 404
+# API para listar todos los números con chats activos
+@app.route("/api/chats", methods=["GET"])
+def obtener_chats():
+    return json.dumps(list(historial_conversaciones.keys()), ensure_ascii=False), 200
+
+# API para devolver el historial de un número específico
 @app.route("/api/conversaciones/<numero>", methods=["GET"])
 def obtener_conversacion(numero):
-    """Devuelve el historial de un chat específico para el panel"""
     if numero in historial_conversaciones:
         return json.dumps(historial_conversaciones[numero], ensure_ascii=False), 200
     return json.dumps([], ensure_ascii=False), 200
 
 @app.route("/api/devolver_bot", methods=["POST"])
 def devolver_bot():
-    """Endpoint auxiliar para el panel"""
     return {"status": "ok"}, 200
 
 if __name__ == "__main__":
