@@ -2,18 +2,18 @@
 Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 3)
 
 VARIABLES DE ENTORNO (en Render: Environment)
-  WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
-  PHONE_NUMBER_ID  Phone Number ID del número del bot                (obligatoria)
-  VERIFY_TOKEN     la clave del webhook (la misma que pusiste en Meta) (obligatoria)
-  PANEL_PASSWORD   clave para entrar al panel de vendedores          (obligatoria)
-  APP_SECRET       "Clave secreta de la app" de Meta                 (muy recomendada)
-                   Meta > tu app > Configuración de la app > Básica
-  SECRET_KEY       texto largo al azar para las sesiones             (opcional)
-  DATA_DIR         carpeta donde se guardan mensajes y archivos      (opcional)
-                   Con disco persistente de Render: /data
+  WHATSAPP_TOKEN    token permanente de Meta                            (obligatoria)
+  PHONE_NUMBER_ID   Phone Number ID del número del bot                  (obligatoria)
+  VERIFY_TOKEN      la clave del webhook (la misma que pusiste en Meta) (obligatoria)
+  PANEL_PASSWORD    clave para entrar al panel de vendedores          (obligatoria)
+  APP_SECRET        "Clave secreta de la app" de Meta                   (muy recomendada)
+                    Meta > tu app > Configuración de la app > Básica
+  SECRET_KEY        texto largo al azar para las sesiones               (opcional)
+  DATA_DIR          carpeta donde se guardan mensajes y archivos        (opcional)
+                    Con disco persistente de Render: /data
 
 ARCHIVOS
-  catalogo/        fotos de productos (arcilla.jpg, etc.). Se suben a GitHub junto con este archivo.
+  catalogo/         fotos de productos (arcilla.jpg, thinner.jpg, etc.). Se suben a GitHub junto con este archivo.
 """
 
 import functools
@@ -42,34 +42,55 @@ log = logging.getLogger("ferreteria")
 
 
 # =====================================================================
-# 1) DATOS DE LA FERRETERÍA  ← esta es la parte que vas a editar
+# 1) DATOS DE LA FERRETERÍA  ← horarios actualizados
 # =====================================================================
-NOMBRE_NEGOCIO = "Ferretería"  # poné acá el nombre real del local
+NOMBRE_NEGOCIO = "Ferretería O'Higgins"
 
 # Días: 0 = lunes ... 6 = domingo. Horas en formato 24 hs.
 TURNOS = [
     ("Lunes a Viernes", (0, 1, 2, 3, 4), "08:30", "19:30"),
     ("Sábados", (5,), "09:00", "13:00"),
 ]
-DIAS_CERRADO = "Domingos y feriados"
-FERIADOS = []  # fechas en que no abrís, formato "AAAA-MM-DD". Ej: ["2026-12-08", "2026-12-25"]
+DIAS_CERRADO = "Domingos"
+FERIADOS = []  # fechas en que no abrís, formato "AAAA-MM-DD"
 
-# Si los dejás vacíos, el bot deriva esas consultas a un vendedor.
-DIRECCION = ""       # Ej: "📍 Estamos en Av. Siempre Viva 123, Salta."
-MEDIOS_DE_PAGO = ""  # Ej: "💳 Aceptamos efectivo, transferencia y tarjetas."
+# Textos automáticos del bot:
+DIRECCION = (
+    "📍 *¡Te esperamos en el local!* Estamos ubicados sobre Av. O'Higgins (Salta).\n\n"
+    "🗺️ Podés ver la ubicación exacta y cómo llegar acá:\n"
+    "https://www.google.com/maps/place/FERRETERIA+O'HIGGINS/@-24.7766477,-65.4036524,17z"
+)
 
-# Productos con info y foto. La foto va en la carpeta "catalogo/" (jpg o png).
-# Sin precios a propósito: los precios los pasa siempre una persona.
+MEDIOS_DE_PAGO = (
+    "💳 ¡Recibimos todos los medios de pago para tu comodidad!\n"
+    "Podés abonar en efectivo, por transferencia o con tarjetas de débito y crédito."
+)
+
+TEXTO_ENVIO = (
+    "🚚 *Sobre envíos a domicilio:*\n"
+    "Por el momento no contamos con envíos a domicilio, ¡pero te esperamos en el local para retirarlo cuando gustes!"
+)
+
+# Productos con info y foto en la carpeta "catalogo/". Sin precios a propósito.
 PRODUCTOS = {
     "arcilla": {
         "nombre": "Arcilla",
         "palabras": ("arcilla", "arcillas"),
         "foto": "arcilla.jpg",
         "texto": (
-            "🧱 *Arcilla refractaria / común* 🛠️\n\n"
-            "Tenemos excelente calidad para tus obras y construcciones. "
+            "🧱 *Arcilla baja temperatura / común* 🛠️\n\n"
             "Viene en presentación lista para usar.\n\n"
             "Para consultar cantidades o precio, escribí *VENDEDOR*."
+        ),
+    },
+    "thinner": {
+        "nombre": "Thinner",
+        "palabras": ("thinner", "tiner", "disolvente"),
+        "foto": "thinner.jpg",
+        "texto": (
+            "🧪 *Thinner / Disolvente* 🛠️\n\n"
+            "Ideal para limpieza y dilución de pinturas. Excelente calidad.\n\n"
+            "Para consultar stock, tamaños o precios, escribí *VENDEDOR*."
         ),
     },
 }
@@ -82,7 +103,6 @@ RESPUESTAS_RAPIDAS = [
     "Gracias por escribirnos, ¡que tengas un buen día!",
 ]
 
-# Si el cliente manda una foto, audio, documento o ubicación, ¿se deriva a un vendedor?
 DERIVAR_ARCHIVOS = True
 
 SALUDO = (
@@ -100,15 +120,15 @@ DERIVACION_PRECIOS = (
     "Los precios y presupuestos te los pasa una persona del equipo, así son siempre los valores "
     "actualizados.\n🔔 Ya te derivé con un vendedor."
 )
-DERIVACION_ARCHIVO = "Recibí lo que me mandaste 📎. Se lo paso a un vendedor para que lo revise. 🔔"
+DERIVACION_ARCHIVO = "Recibí lo que mandaste 📎. Se lo paso a un vendedor para que lo revise. 🔔"
 DERIVACION_SIN_DATO = "Eso te lo confirma un vendedor. 🔔 Ya lo avisé y te responde por acá."
 DERIVACION_INSISTENCIA = "Creo que te va a ayudar mejor una persona. 🔔 Te derivé con un vendedor."
 AVISO_FUERA_DE_HORARIO = "🌙 Ahora estamos fuera de horario: te responden apenas abramos."
-MAX_FALLOS = 2  # después de tantos "no te entendí" seguidos se deriva a un vendedor
+MAX_FALLOS = 2
 
 
 # =====================================================================
-# 2) CONFIGURACIÓN TÉCNICA (no hace falta tocar)
+# 2) CONFIGURACIÓN TÉCNICA
 # =====================================================================
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
@@ -138,9 +158,9 @@ DATA_DIR = _preparar_datos()
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 DB_PATH = os.path.join(DATA_DIR, "ferreteria.db")
 
-TZ_AR = timezone(timedelta(hours=-3))  # Argentina no usa horario de verano
-QUITAR_9_ARGENTINA = True  # Meta manda 549..., pero para responder va sin el 9
-VENTANA_SEGUNDOS = 24 * 3600  # WhatsApp solo deja escribir texto libre 24 hs después del último mensaje del cliente
+TZ_AR = timezone(timedelta(hours=-3))
+QUITAR_9_ARGENTINA = True
+VENTANA_SEGUNDOS = 24 * 3600
 MAX_BAJADA = 20 * 1024 * 1024
 MAX_FOTO = 5 * 1024 * 1024
 MAX_PDF = 16 * 1024 * 1024
@@ -159,12 +179,9 @@ app.config.update(
 )
 
 if not APP_SECRET:
-    log.warning(
-        "⚠️ Falta APP_SECRET: cualquiera que conozca la dirección del webhook podría "
-        "mandar mensajes falsos. Cargala en Render (Environment)."
-    )
+    log.warning("⚠️ Falta APP_SECRET en Render.")
 if not PANEL_PASSWORD:
-    log.warning("⚠️ Falta PANEL_PASSWORD: el panel queda desactivado.")
+    log.warning("⚠️ Falta PANEL_PASSWORD en Render.")
 
 
 # =====================================================================
@@ -172,39 +189,39 @@ if not PANEL_PASSWORD:
 # =====================================================================
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversaciones (
-    numero         TEXT PRIMARY KEY,
-    nombre         TEXT NOT NULL DEFAULT '',
-    perfil         TEXT NOT NULL DEFAULT '',
-    humano         INTEGER NOT NULL DEFAULT 0,
-    pide_vendedor  INTEGER NOT NULL DEFAULT 0,
-    pide_desde     REAL NOT NULL DEFAULT 0,
-    no_leidos      INTEGER NOT NULL DEFAULT 0,
-    fallos         INTEGER NOT NULL DEFAULT 0,
-    ultimo         REAL NOT NULL DEFAULT 0,
-    ultimo_cliente REAL NOT NULL DEFAULT 0,
-    ult_texto      TEXT NOT NULL DEFAULT '',
-    creada         REAL NOT NULL DEFAULT 0
+    numero           TEXT PRIMARY KEY,
+    nombre           TEXT NOT NULL DEFAULT '',
+    perfil           TEXT NOT NULL DEFAULT '',
+    humano           INTEGER NOT NULL DEFAULT 0,
+    pide_vendedor    INTEGER NOT NULL DEFAULT 0,
+    pide_desde       REAL NOT NULL DEFAULT 0,
+    no_leidos        INTEGER NOT NULL DEFAULT 0,
+    fallos           INTEGER NOT NULL DEFAULT 0,
+    ultimo           REAL NOT NULL DEFAULT 0,
+    ultimo_cliente   REAL NOT NULL DEFAULT 0,
+    ult_texto        TEXT NOT NULL DEFAULT '',
+    creada           REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS mensajes (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    numero         TEXT NOT NULL,
-    quien          TEXT NOT NULL,
-    tipo           TEXT NOT NULL DEFAULT 'text',
-    texto          TEXT NOT NULL DEFAULT '',
-    archivo        TEXT NOT NULL DEFAULT '',
-    nombre_archivo TEXT NOT NULL DEFAULT '',
-    ts             REAL NOT NULL,
-    wamid          TEXT NOT NULL DEFAULT '',
-    estado         TEXT NOT NULL DEFAULT '',
-    error          TEXT NOT NULL DEFAULT ''
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    numero           TEXT NOT NULL,
+    quien            TEXT NOT NULL,
+    tipo             TEXT NOT NULL DEFAULT 'text',
+    texto            TEXT NOT NULL DEFAULT '',
+    archivo          TEXT NOT NULL DEFAULT '',
+    nombre_archivo   TEXT NOT NULL DEFAULT '',
+    ts               REAL NOT NULL,
+    wamid            TEXT NOT NULL DEFAULT '',
+    estado           TEXT NOT NULL DEFAULT '',
+    error            TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_mensajes_numero ON mensajes (numero, id);
 CREATE INDEX IF NOT EXISTS idx_mensajes_wamid ON mensajes (wamid);
 CREATE TABLE IF NOT EXISTS vistos (wamid TEXT PRIMARY KEY, ts REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS eventos (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts      REAL NOT NULL,
-    tipo    TEXT NOT NULL,
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     REAL NOT NULL,
+    tipo   TEXT NOT NULL,
     detalle TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_eventos_ts ON eventos (ts);
@@ -213,7 +230,6 @@ CREATE INDEX IF NOT EXISTS idx_eventos_ts ON eventos (ts);
 
 @contextmanager
 def tx():
-    """Abre la base, confirma los cambios al salir y la cierra siempre."""
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
     try:
@@ -258,7 +274,6 @@ def numero_valido(numero):
 
 
 def normalizar(texto):
-    """minúsculas, sin tildes ni signos: '¿Horários?' -> 'horarios'."""
     t = unicodedata.normalize("NFD", (texto or "").lower())
     t = "".join(c for c in t if unicodedata.category(c) != "Mn")
     t = re.sub(r"[^a-z0-9 ]+", " ", t)
@@ -266,7 +281,6 @@ def normalizar(texto):
 
 
 def tiene(t, palabras):
-    """True si alguna palabra o frase aparece COMPLETA en el texto ya normalizado."""
     envuelto = f" {t} "
     return any(f" {normalizar(p)} " in envuelto for p in palabras)
 
@@ -308,7 +322,6 @@ _locks_guardia = threading.Lock()
 
 
 def lock_de(numero):
-    """Un candado por cliente: sus mensajes se procesan de a uno, en orden."""
     with _locks_guardia:
         return _locks.setdefault(numero, threading.Lock())
 
@@ -365,13 +378,12 @@ def conv(numero):
 
 
 def marcar(numero, **campos):
-    claves = ", ".join(f"{k}=?" for k in campos)  # los nombres salen de este archivo, nunca del usuario
+    claves = ", ".join(f"{k}=?" for k in campos)
     with tx() as con:
         con.execute(f"UPDATE conversaciones SET {claves} WHERE numero=?", (*campos.values(), numero))
 
 
 def evento(tipo, detalle=""):
-    """Anota qué consultan los clientes (sin número de teléfono) para el reporte semanal."""
     try:
         with tx() as con:
             con.execute(
@@ -406,7 +418,6 @@ ORDEN_ESTADO = {"sent": 1, "delivered": 2, "read": 3, "failed": 9}
 
 
 def actualizar_estado(st):
-    """Meta avisa si un mensaje se entregó, se leyó o falló."""
     wamid = st.get("id")
     nuevo = st.get("status")
     if not wamid or nuevo not in ORDEN_ESTADO:
@@ -416,7 +427,6 @@ def actualizar_estado(st):
         errs = st.get("errors") or [{}]
         e = errs[0]
         error = f"{e.get('title') or e.get('message') or 'No se pudo entregar'} ({e.get('code', '?')})"
-        log.warning("WhatsApp no pudo entregar %s: %s", wamid, error)
     with tx() as con:
         fila = con.execute("SELECT id, estado FROM mensajes WHERE wamid=?", (wamid,)).fetchone()
         if fila is None:
@@ -427,7 +437,7 @@ def actualizar_estado(st):
 
 
 # =====================================================================
-# 6) ENVÍO A WHATSAPP (API de Meta)
+# 6) ENVÍO A WHATSAPP
 # =====================================================================
 def cabecera():
     return {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
@@ -449,13 +459,11 @@ def detalle_error(r):
 
 
 def meta_post(payload):
-    """Devuelve (ok, id_del_mensaje, error)."""
     try:
         r = requests.post(f"{GRAPH}/{PHONE_NUMBER_ID}/messages", headers=cabecera(), json=payload, timeout=15)
     except requests.RequestException as e:
         log.error("No se pudo conectar con WhatsApp: %r", e)
         return False, "", "No se pudo conectar con WhatsApp"
-    log.info("ENVIO -> %s %s", r.status_code, r.text[:300])
     if r.ok:
         try:
             return True, r.json()["messages"][0]["id"], ""
@@ -490,7 +498,6 @@ def enviar_botones(numero, cuerpo):
 
 
 def subir_media(ruta, mime):
-    """Sube un archivo a Meta. Devuelve (id_del_archivo, error)."""
     try:
         with open(ruta, "rb") as f:
             r = requests.post(
@@ -498,15 +505,10 @@ def subir_media(ruta, mime):
                 data={"messaging_product": "whatsapp", "type": mime},
                 files={"file": (os.path.basename(ruta), f, mime)}, timeout=40,
             )
-        log.info("SUBIDA -> %s %s", r.status_code, r.text[:200])
         if r.ok:
             return r.json().get("id", ""), ""
         return "", detalle_error(r)
-    except requests.RequestException as e:
-        log.error("No se pudo subir el archivo: %r", e)
-        return "", "No se pudo conectar con WhatsApp"
     except Exception as e:
-        log.exception("Error subiendo archivo")
         return "", str(e)
 
 
@@ -515,7 +517,7 @@ def mime_por_extension(ruta):
         os.path.splitext(ruta)[1].lower(), "")
 
 
-MEDIA_IDS = {}  # fotos del catálogo ya subidas a Meta: nombre -> (id, hora). Meta las guarda ~30 días.
+MEDIA_IDS = {}
 
 
 def enviar_foto_catalogo(numero, foto, texto):
@@ -539,11 +541,10 @@ def enviar_foto_catalogo(numero, foto, texto):
         })
         if ok:
             return True, wamid, ""
-        MEDIA_IDS.pop(foto, None)  # por si Meta ya la borró: la volvemos a subir
+        MEDIA_IDS.pop(foto, None)
     return False, "", error
 
 
-# ---- mensajes del bot (se envían Y se anotan en el panel) ------------
 def decir(numero, texto, quien="bot"):
     ok, wamid, error = enviar_texto(numero, texto)
     registrar(numero, quien, "text", texto, wamid=wamid, estado="sent" if ok else "failed", error=error)
@@ -551,13 +552,11 @@ def decir(numero, texto, quien="bot"):
 
 
 def decir_menu(numero, intro):
-    """Menú con 3 botones. Si Meta no lo acepta, manda el menú escrito."""
     ok, wamid, error = enviar_botones(numero, intro + "\n\nElegí una opción 👇")
     if ok:
         registrar(numero, "bot", "text", intro + "\n🔘 Menú: Horarios · Productos · Vendedor",
                   wamid=wamid, estado="sent")
         return
-    log.warning("Los botones no funcionaron (%s): mando el menú escrito", error)
     decir(numero, intro + "\n\n" + MENU_ESCRITO)
 
 
@@ -569,7 +568,6 @@ def enviar_producto(numero, clave):
         if ok:
             registrar(numero, "bot", "image", p["texto"], archivo="c/" + foto, wamid=wamid, estado="sent")
             return
-        log.warning("No pude mandar la foto %s (%s): mando solo el texto", foto, error)
     decir(numero, p["texto"])
 
 
@@ -591,6 +589,7 @@ PALABRAS_DIRECCION = ("direccion", "ubicacion", "donde estan", "donde queda", "d
                       "donde esta", "como llego")
 PALABRAS_PAGO = ("medios de pago", "formas de pago", "pagar", "pago", "tarjeta", "tarjetas",
                  "efectivo", "transferencia", "cuotas", "mercado pago", "debito", "credito")
+PALABRAS_ENVIO = ("envio", "envios", "delivery", "llevan", "mandan", "alcansas", "alcanzan")
 PALABRAS_PRODUCTOS = ("productos", "catalogo", "que venden", "que vende", "que tienen")
 PALABRAS_MENU = ("menu", "opciones", "ayuda", "inicio", "info", "informacion")
 PALABRAS_SALUDO = ("hola", "buenas", "buen dia", "buenos dias", "buenas tardes", "buenas noches", "hey")
@@ -603,7 +602,6 @@ def productos_en(t):
 
 
 def derivar(numero, motivo, mensaje):
-    """Pasa la conversación a una persona: el bot se calla y el panel marca el 🔔."""
     evento("vendedor", motivo)
     marcar(numero, humano=1, pide_vendedor=1, pide_desde=time.time(), fallos=0)
     if not abierto_ahora():
@@ -633,6 +631,8 @@ def responder(numero, texto, primer_mensaje):
         if not MEDIOS_DE_PAGO:
             return derivar(numero, "pago", DERIVACION_SIN_DATO)
         decir(numero, MEDIOS_DE_PAGO)
+    elif tiene(t, PALABRAS_ENVIO):
+        decir(numero, TEXTO_ENVIO)
     elif claves:
         for clave in claves[:3]:
             enviar_producto(numero, clave)
@@ -644,7 +644,7 @@ def responder(numero, texto, primer_mensaje):
     elif tiene(t, PALABRAS_GRACIAS):
         decir(numero, "¡De nada! 🙌 Cualquier cosa, escribinos.")
     elif primer_mensaje:
-        evento("no_entendido", texto)  # lo anotamos, pero primero lo saludamos
+        evento("no_entendido", texto)
         decir_menu(numero, SALUDO)
         return
     else:
@@ -661,12 +661,10 @@ EXT_POR_MIME = {
     "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac",
     "audio/amr": ".amr", "video/mp4": ".mp4", "video/3gpp": ".3gp", "application/pdf": ".pdf",
 }
-MIME_POR_EXT = {v: k for k, v in EXT_POR_MIME.items()}
 MEDIA_TIPOS = ("image", "document", "audio", "video", "sticker")
 
 
 def bajar_media(media_id, nombre_original=""):
-    """Baja el archivo del cliente y lo guarda en una carpeta privada. Devuelve 'm/archivo' o ''."""
     if not media_id:
         return ""
     try:
@@ -690,7 +688,7 @@ def bajar_media(media_id, nombre_original=""):
             f.write(d.content)
         return "m/" + nombre
     except Exception as e:
-        log.error("No se pudo bajar el archivo %s: %r", media_id, e)
+        log.error("No se pudo bajar el archivo: %r", e)
         return ""
 
 
@@ -700,10 +698,10 @@ def procesar_mensaje(msg, perfil=""):
     if not numero_valido(numero):
         return
     if wamid and not marcar_visto(wamid):
-        return  # Meta reenvió un mensaje que ya procesamos
+        return
     tipo = msg.get("type", "")
     if tipo == "reaction":
-        return  # un 👍 del cliente no merece respuesta
+        return
 
     with lock_de(numero):
         texto, entrada = "", ""
@@ -739,7 +737,7 @@ def procesar_mensaje(msg, perfil=""):
             marcar(numero, perfil=perfil[:60])
 
         if conv(numero)["humano"]:
-            return  # atiende una persona: el bot se queda callado
+            return
 
         if es_archivo:
             evento("archivo", tipo)
@@ -771,7 +769,6 @@ def procesar_valor(valor):
 # 8) WEBHOOK DE META
 # =====================================================================
 def firma_valida():
-    """Comprueba que el aviso lo mandó realmente Meta (firma con la clave secreta de la app)."""
     if not APP_SECRET:
         return True
     enviada = request.headers.get("X-Hub-Signature-256", "")
@@ -811,13 +808,13 @@ def recibir():
                     threading.Thread(target=procesar_valor, args=(valor,), daemon=True).start()
     except Exception:
         log.exception("Error leyendo el webhook")
-    return "ok", 200  # contestamos rápido: Meta reintenta si tardamos
+    return "ok", 200
 
 
 # =====================================================================
 # 9) ACCESO AL PANEL
 # =====================================================================
-INTENTOS = {}  # ip -> (fallos, desde)
+INTENTOS = {}
 
 
 def bloqueado(ip):
@@ -839,763 +836,211 @@ def pagina_login(error=""):
         '<form method="post" action="/login" style="background:#fff;padding:24px;'
         'border-radius:10px;max-width:340px;width:100%;box-shadow:0 1px 4px #0003">'
         '<h2 style="margin-top:0">📋 Panel de la ferretería</h2>'
+        f"{aviso}"
         '<input type="password" name="clave" placeholder="Clave del panel" '
         'autofocus required style="width:100%;padding:10px;font-size:16px;box-sizing:border-box">'
-        '<button style="margin-top:12px;width:100%;padding:10px;border:0;'
-        'border-radius:8px;background:#075e54;color:#fff;font-size:16px">Entrar</button>'
-        f"{aviso}</form></body></html>"
+        '<button style="margin-top:12px;width:100%;padding:10px;background:#00a884;'
+        'color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer">Ingresar</button>'
+        "</form></body></html>"
     )
 
 
-@app.route("/login", methods=["POST"])
-def login():
-    if not PANEL_PASSWORD:
-        return pagina_login("Panel desactivado: falta cargar PANEL_PASSWORD en el servidor."), 503
-    ip = request.remote_addr or "?"
-    if bloqueado(ip):
-        return pagina_login("Demasiados intentos. Probá de nuevo en unos minutos."), 429
-    clave = request.form.get("clave", "")
-    if hmac.compare_digest(clave.encode(), PANEL_PASSWORD.encode()):
-        INTENTOS.pop(ip, None)
-        session.clear()
-        session.permanent = True
-        session["ok"] = True
-        return redirect("/panel")
-    fallos, desde = INTENTOS.get(ip, (0, time.time()))
-    INTENTOS[ip] = (fallos + 1, desde)
-    return pagina_login("Clave incorrecta."), 401
-
-
-@app.route("/salir")
-def salir():
-    session.clear()
-    return redirect("/panel")
-
-
-def requiere_login(f):
-    @functools.wraps(f)
-    def envoltura(*args, **kwargs):
-        if not session.get("ok"):
-            return jsonify({"error": "no autorizado"}), 401
-        return f(*args, **kwargs)
-    return envoltura
-
-
-@app.after_request
-def cabeceras_seguras(resp):
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "same-origin")
-    if request.path.startswith("/api/") or request.path == "/panel":
-        resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.errorhandler(413)
-def demasiado_grande(_e):
-    return jsonify({"ok": False, "error": "El archivo es demasiado grande (máximo 20 MB)."}), 413
-
-
-# =====================================================================
-# 10) API DEL PANEL (todas exigen haber iniciado sesión)
-# =====================================================================
-def titulo(c):
-    return c["nombre"] or c["perfil"] or "+" + c["numero"]
-
-
-def ventana_abierta(c):
-    return time.time() - c["ultimo_cliente"] < VENTANA_SEGUNDOS
-
-
-MSG_VENTANA = (
-    "Pasaron más de 24 hs desde el último mensaje del cliente. WhatsApp no deja escribirle "
-    "primero con texto libre (haría falta una plantilla aprobada). Esperá a que él escriba."
-)
-
-
-@app.route("/api/config")
-@requiere_login
-def api_config():
-    return jsonify({"rapidas": RESPUESTAS_RAPIDAS, "negocio": NOMBRE_NEGOCIO})
-
-
-@app.route("/api/conversaciones")
-@requiere_login
-def api_conversaciones():
-    with tx() as con:
-        filas = con.execute(
-            "SELECT * FROM conversaciones ORDER BY pide_vendedor DESC, ultimo DESC LIMIT 300"
-        ).fetchall()
-    ahora_ts = time.time()
-    return jsonify([{
-        "numero": c["numero"],
-        "titulo": titulo(c),
-        "texto": c["ult_texto"],
-        "hora": fmt(c["ultimo"]),
-        "no_leidos": c["no_leidos"],
-        "humano": bool(c["humano"]),
-        "pide_vendedor": bool(c["pide_vendedor"]),
-        "espera_min": int((ahora_ts - c["pide_desde"]) // 60) if c["pide_vendedor"] else 0,
-    } for c in filas])
-
-
-@app.route("/api/conversaciones/<numero>")
-@requiere_login
-def api_conversacion(numero):
-    if not numero_valido(numero):
-        return jsonify({"error": "número inválido"}), 400
-    with tx() as con:
-        c = con.execute("SELECT * FROM conversaciones WHERE numero=?", (numero,)).fetchone()
-        if c is None:
-            return jsonify({"error": "no existe"}), 404
-        con.execute("UPDATE conversaciones SET no_leidos=0 WHERE numero=?", (numero,))
-        filas = con.execute(
-            "SELECT * FROM (SELECT * FROM mensajes WHERE numero=? ORDER BY id DESC LIMIT 300) ORDER BY id",
-            (numero,),
-        ).fetchall()
-    return jsonify({
-        "numero": numero,
-        "titulo": titulo(c),
-        "nombre": c["nombre"],
-        "humano": bool(c["humano"]),
-        "pide_vendedor": bool(c["pide_vendedor"]),
-        "ventana": ventana_abierta(c),
-        "mensajes": [{
-            "id": m["id"], "quien": m["quien"], "tipo": m["tipo"], "texto": m["texto"],
-            "archivo": "/media/" + m["archivo"] if m["archivo"] else "",
-            "nombre_archivo": m["nombre_archivo"], "hora": fmt(m["ts"]),
-            "estado": m["estado"], "error": m["error"],
-        } for m in filas],
-    })
-
-
-@app.route("/api/guardar_nombre", methods=["POST"])
-@requiere_login
-def api_guardar_nombre():
-    data = request.get_json(silent=True) or {}
-    numero = str(data.get("numero", ""))
-    nombre = str(data.get("nombre", "")).strip()[:60]
-    if not numero_valido(numero) or conv(numero) is None:
-        return jsonify({"ok": False, "error": "Número inválido"}), 400
-    marcar(numero, nombre=nombre)
-    return jsonify({"ok": True})
-
-
-def _despues_de_enviar(numero):
-    marcar(numero, humano=1, pide_vendedor=0, fallos=0)  # ya lo atiende una persona
-
-
-@app.route("/api/enviar", methods=["POST"])
-@requiere_login
-def api_enviar():
-    data = request.get_json(silent=True) or {}
-    numero = str(data.get("numero", ""))
-    texto = str(data.get("texto", "")).strip()
-    if not numero_valido(numero) or not texto:
-        return jsonify({"ok": False, "error": "Faltan datos"}), 400
-    if len(texto) > 4000:
-        return jsonify({"ok": False, "error": "Mensaje demasiado largo"}), 400
-    c = conv(numero)
-    if c is None:
-        return jsonify({"ok": False, "error": "La conversación no existe"}), 404
-    if not ventana_abierta(c):
-        return jsonify({"ok": False, "error": MSG_VENTANA}), 409
-    ok, wamid, error = enviar_texto(numero, texto)
-    if not ok:
-        return jsonify({"ok": False, "error": error}), 502
-    registrar(numero, "vendedor", "text", texto, wamid=wamid, estado="sent")
-    _despues_de_enviar(numero)
-    return jsonify({"ok": True})
-
-
-def detectar_tipo(datos):
-    """Mira el contenido real del archivo (no solo el nombre)."""
-    if datos.startswith(b"\xff\xd8\xff"):
-        return "image", ".jpg", "image/jpeg"
-    if datos.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image", ".png", "image/png"
-    if datos.startswith(b"%PDF"):
-        return "document", ".pdf", "application/pdf"
-    return None, None, None
-
-
-@app.route("/api/enviar_archivo", methods=["POST"])
-@requiere_login
-def api_enviar_archivo():
-    numero = str(request.form.get("numero", ""))
-    caption = str(request.form.get("texto", "")).strip()[:1000]
-    archivo = request.files.get("archivo")
-    if not numero_valido(numero) or archivo is None:
-        return jsonify({"ok": False, "error": "Faltan datos"}), 400
-    c = conv(numero)
-    if c is None:
-        return jsonify({"ok": False, "error": "La conversación no existe"}), 404
-    if not ventana_abierta(c):
-        return jsonify({"ok": False, "error": MSG_VENTANA}), 409
-
-    datos = archivo.read()
-    tipo, ext, mime = detectar_tipo(datos)
-    if not tipo:
-        return jsonify({"ok": False, "error": "Solo se pueden enviar fotos JPG o PNG y archivos PDF."}), 400
-    if len(datos) > (MAX_FOTO if tipo == "image" else MAX_PDF):
-        return jsonify({"ok": False, "error": "El archivo es demasiado pesado (fotos hasta 5 MB, PDF hasta 16 MB)."}), 400
-
-    nombre = uuid.uuid4().hex + ext
-    ruta = os.path.join(MEDIA_DIR, nombre)
-    with open(ruta, "wb") as f:
-        f.write(datos)
-    nombre_mostrado = secure_filename(archivo.filename or "")[:80] or ("documento.pdf" if tipo == "document" else "foto" + ext)
-
-    media_id, error = subir_media(ruta, mime)
-    if not media_id:
-        return jsonify({"ok": False, "error": error or "No se pudo subir el archivo a WhatsApp"}), 502
-    cuerpo = {"id": media_id}
-    if tipo == "image":
-        if caption:
-            cuerpo["caption"] = caption
-    else:
-        cuerpo["filename"] = nombre_mostrado
-        if caption:
-            cuerpo["caption"] = caption
-    ok, wamid, error = meta_post({
-        "messaging_product": "whatsapp", "to": a_destino(numero), "type": tipo, tipo: cuerpo,
-    })
-    if not ok:
-        return jsonify({"ok": False, "error": error}), 502
-    registrar(numero, "vendedor", tipo, caption, archivo="m/" + nombre,
-              nombre_archivo=nombre_mostrado if tipo == "document" else "", wamid=wamid, estado="sent")
-    _despues_de_enviar(numero)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/devolver_bot", methods=["POST"])
-@requiere_login
-def api_devolver_bot():
-    data = request.get_json(silent=True) or {}
-    numero = str(data.get("numero", ""))
-    if not numero_valido(numero) or conv(numero) is None:
-        return jsonify({"ok": False, "error": "Número inválido"}), 400
-    marcar(numero, humano=0, pide_vendedor=0, fallos=0)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/reporte")
-@requiere_login
-def api_reporte():
-    try:
-        dias = max(1, min(90, int(request.args.get("dias", 7))))
-    except ValueError:
-        dias = 7
-    desde = time.time() - dias * 86400
-    with tx() as con:
-        nuevas = con.execute("SELECT COUNT(*) FROM conversaciones WHERE creada>=?", (desde,)).fetchone()[0]
-        recibidos = con.execute(
-            "SELECT COUNT(*) FROM mensajes WHERE quien='cliente' AND ts>=?", (desde,)).fetchone()[0]
-        motivos = con.execute(
-            "SELECT detalle, COUNT(*) n FROM eventos WHERE tipo='vendedor' AND ts>=? "
-            "GROUP BY detalle ORDER BY n DESC", (desde,)).fetchall()
-        prods = con.execute(
-            "SELECT detalle, COUNT(*) n FROM eventos WHERE tipo='producto' AND ts>=? "
-            "GROUP BY detalle ORDER BY n DESC LIMIT 10", (desde,)).fetchall()
-        sin_entender = con.execute(
-            "SELECT MIN(detalle) d, COUNT(*) n FROM eventos WHERE tipo='no_entendido' AND ts>=? "
-            "GROUP BY lower(detalle) ORDER BY n DESC, MAX(ts) DESC LIMIT 15", (desde,)).fetchall()
-        por_dia = con.execute(
-            "SELECT strftime('%d/%m', ts, 'unixepoch', '-3 hours') dia, COUNT(*) n FROM mensajes "
-            "WHERE quien='cliente' AND ts>=? GROUP BY dia ORDER BY MIN(ts)", (desde,)).fetchall()
-    nombres_motivo = {
-        "pedido": "Pidieron un vendedor", "precio": "Preguntaron precios", "archivo": "Mandaron foto/audio/archivo",
-        "insistencia": "El bot no los entendió (2 veces)", "direccion": "Dirección (sin dato cargado)",
-        "pago": "Medios de pago (sin dato cargado)",
-    }
-    return jsonify({
-        "dias": dias,
-        "conversaciones_nuevas": nuevas,
-        "mensajes_clientes": recibidos,
-        "derivaciones": sum(m["n"] for m in motivos),
-        "motivos": [{"texto": nombres_motivo.get(m["detalle"], m["detalle"]), "n": m["n"]} for m in motivos],
-        "productos": [{"texto": PRODUCTOS.get(p["detalle"], {}).get("nombre", p["detalle"]), "n": p["n"]} for p in prods],
-        "sin_entender": [{"texto": s["d"], "n": s["n"]} for s in sin_entender],
-        "por_dia": [{"texto": d["dia"], "n": d["n"]} for d in por_dia],
-    })
-
-
-@app.route("/media/<origen>/<nombre>")
-@requiere_login
-def media(origen, nombre):
-    """Archivos de clientes y fotos del catálogo: solo se ven con sesión iniciada."""
-    base = {"m": MEDIA_DIR, "c": CATALOGO_DIR}.get(origen)
-    if base is None or secure_filename(nombre) != nombre:
-        abort(404)
-    ruta = os.path.join(base, nombre)
-    if not os.path.isfile(ruta):
-        abort(404)
-    ext = os.path.splitext(nombre)[1].lower()
-    mime = MIME_POR_EXT.get(ext) or {".jpeg": "image/jpeg"}.get(ext)
-    resp = send_file(ruta, mimetype=mime or "application/octet-stream", as_attachment=not mime, download_name=nombre)
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Cache-Control"] = "private, max-age=3600"
-    return resp
-
-
-# =====================================================================
-# 11) PANEL WEB  (se abre en /panel)
-# =====================================================================
-PANEL_HTML = r"""<!doctype html>
-<html lang="es"><head>
+PANEL_HTML = """<!doctype html>
+<html lang="es">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-__NONCE__'; style-src 'nonce-__NONCE__'; img-src 'self' blob: data:; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'">
 <title>Panel Ferretería</title>
 <style nonce="__NONCE__">
-:root{--verde:#075e54;--gris:#667781;--borde:#e3e3e3;--fondo:#efeae2}
-*{box-sizing:border-box}
-body{margin:0;height:100vh;height:100dvh;display:flex;flex-direction:column;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--fondo);color:#111}
-header{background:var(--verde);color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px}
-header .der{display:flex;align-items:center;gap:8px}
-header a{color:#fff;font-size:14px}
-button{border:0;border-radius:8px;padding:8px 14px;background:var(--verde);color:#fff;font:inherit;cursor:pointer}
-button.sec{background:var(--gris)}
-button.ghost{background:rgba(255,255,255,.18);padding:6px 10px;font-size:13px}
-button:disabled{opacity:.5;cursor:default}
-.oculto{display:none!important}
-#main{flex:1;display:flex;min-height:0}
-#colLista{width:340px;background:#fff;border-right:1px solid var(--borde);display:flex;flex-direction:column;min-height:0}
-.filtros{padding:8px;border-bottom:1px solid var(--borde);display:flex;flex-direction:column;gap:6px}
-.filtros input[type=search]{padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit}
-.chk{font-size:13px;color:var(--gris);display:flex;align-items:center;gap:6px}
-#lista{overflow-y:auto;flex:1}
-.item{padding:11px 14px;border-bottom:1px solid #f0f0f0;cursor:pointer}
-.item:hover,.item.sel{background:#f0f2f5}
-.item.pide{background:#fff4d6}
-.fila{display:flex;justify-content:space-between;gap:8px}
-.num{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hora{font-size:12px;color:var(--gris);white-space:nowrap}
-.prev{font-size:13px;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
-.badge{background:#25d366;color:#fff;border-radius:10px;padding:0 7px;font-size:12px;margin-left:6px}
-.vacio{padding:24px;text-align:center;color:var(--gris)}
-#chat{flex:1;display:flex;flex-direction:column;min-width:0}
-#vacio{margin:auto}
-#panelChat{flex:1;display:flex;flex-direction:column;min-height:0}
-#cab{background:#f0f2f5;padding:8px 12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--borde);flex-wrap:wrap}
-#cab .atras{display:none}
-#titulo{font-size:16px}
-#nombreCaja{display:flex;gap:6px}
-#inputNombre{padding:5px 8px;border:1px solid #ccc;border-radius:6px;font-size:13px;width:150px}
-#estado{margin-left:auto;font-size:13px;color:var(--gris)}
-#avisoVentana{background:#fff3cd;color:#664d03;padding:8px 12px;font-size:13px;border-bottom:1px solid #ffe69c}
-#msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
-.msg{max-width:78%;padding:7px 10px;border-radius:8px;box-shadow:0 1px 1px #0002;overflow-wrap:anywhere}
-.msg .cuerpo{white-space:pre-wrap}
-.etq{font-size:11px;font-weight:600;color:#555;display:block;margin-bottom:2px}
-.cliente{background:#fff;align-self:flex-start}
-.bot{background:#d9edff;align-self:flex-end}
-.vendedor{background:#dcf8c6;align-self:flex-end}
-.pie{display:block;font-size:11px;color:var(--gris);margin-top:3px;text-align:right}
-.tick.leido{color:#34b7f1}
-.falla{margin-top:4px;font-size:12px;color:#b00020}
-img.foto{max-width:240px;max-height:260px;border-radius:8px;cursor:pointer;display:block;margin-bottom:4px}
-video.video{max-width:260px;border-radius:8px;display:block;margin-bottom:4px}
-audio{max-width:240px;display:block;margin-bottom:4px}
-a.archivo{display:inline-block;padding:6px 10px;background:var(--verde);color:#fff;border-radius:6px;text-decoration:none;font-size:13px;margin-bottom:4px}
-#rapidas{display:flex;gap:6px;overflow-x:auto;padding:6px 10px 0;background:#f0f2f5}
-.chip{background:#fff;color:#111;border:1px solid #ccc;border-radius:14px;padding:4px 10px;font-size:12px;white-space:nowrap}
-#form{display:flex;gap:8px;padding:10px;background:#f0f2f5;align-items:center}
-#texto{flex:1;resize:none;border:1px solid #ccc;border-radius:8px;padding:8px;font:inherit;height:44px}
-.adjuntar{cursor:pointer;font-size:22px;padding:0 6px;display:flex;align-items:center}
-#toast{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);background:#323232;color:#fff;padding:10px 16px;border-radius:8px;max-width:90vw;z-index:20;font-size:14px}
-#toast.malo{background:#b00020}
-#modal{position:fixed;inset:0;background:#0008;display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
-.caja{background:#fff;border-radius:10px;max-width:520px;width:100%;max-height:90vh;overflow-y:auto;padding:18px}
-.caja h2{margin:0 0 6px}
-.caja h3{margin:16px 0 4px;font-size:15px}
-.caja ul{margin:0;padding-left:18px}
-.caja li{margin:2px 0}
-.cifras{display:flex;gap:10px;flex-wrap:wrap}
-.cifra{background:#f0f2f5;border-radius:8px;padding:8px 12px;flex:1;min-width:110px}
-.cifra b{display:block;font-size:22px}
-.suave{color:var(--gris);font-size:13px}
-@media(max-width:700px){
- #colLista{width:100%}
- #main.abierto #colLista{display:none}
- #main:not(.abierto) #chat{display:none}
- #cab .atras{display:inline-block}
- #inputNombre{width:110px}
- .msg{max-width:90%}
-}
-</style></head><body>
-<header>
- <strong>📋 Panel de la ferretería</strong>
- <span class="der">
-  <button class="ghost" id="btnSonido">🔕 Sonido: no</button>
-  <button class="ghost" id="btnReporte">📊 Reporte</button>
-  <a href="/salir">Salir</a>
- </span>
-</header>
-<div id="main">
- <aside id="colLista">
-  <div class="filtros">
-   <input type="search" id="buscar" placeholder="Buscar por nombre o número...">
-   <label class="chk"><input type="checkbox" id="soloPend"> Solo los que esperan vendedor <span id="cuentaPend"></span></label>
-  </div>
-  <div id="lista"></div>
- </aside>
- <section id="chat">
-  <div id="vacio" class="vacio">Elegí una conversación de la lista.</div>
-  <div id="panelChat" class="oculto">
-   <div id="cab">
-    <button class="sec atras" id="atras">←</button>
-    <strong id="titulo"></strong>
-    <span id="nombreCaja"><input type="text" id="inputNombre" placeholder="Nombre del cliente" maxlength="60"><button class="sec" id="guardarNombre">Guardar</button></span>
-    <span id="estado"></span>
-    <button class="sec oculto" id="devolver">Devolver al bot</button>
-   </div>
-   <div id="avisoVentana" class="oculto">⏳ Pasaron más de 24 hs desde el último mensaje del cliente: WhatsApp no deja escribirle primero. Esperá a que él escriba.</div>
-   <div id="msgs"></div>
-   <div id="rapidas"></div>
-   <div id="form">
-    <label class="adjuntar" title="Adjuntar foto o PDF">📎<input type="file" id="inputArchivo" accept="image/*,.pdf,application/pdf" class="oculto"></label>
-    <textarea id="texto" placeholder="Escribí tu respuesta..."></textarea>
-    <button id="enviar">Enviar</button>
-   </div>
-  </div>
- </section>
+body { font-family: system-ui, sans-serif; margin: 0; background: #efeae2; display: flex; height: 100vh; color: #111; }
+#lista { width: 340px; background: #fff; border-right: 1px solid #ddd; display: flex; flex-direction: column; }
+#chat { flex: 1; display: flex; flex-direction: column; background: #efeae2; }
+.header { padding: 14px 16px; background: #f0f2f5; font-weight: bold; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; }
+.conversaciones { overflow-y: auto; flex: 1; }
+.item { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; cursor: pointer; display: flex; justify-content: space-between; align-items: flex-start; }
+.item:hover { background: #f5f6f6; }
+.item.activo { background: #f0f2f5; }
+.item .num { font-weight: bold; font-size: 15px; }
+.item .txt { color: #666; font-size: 13px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.badge { background: #25d366; color: white; border-radius: 50%; padding: 2px 6px; font-size: 11px; font-weight: bold; }
+.campana { color: #b00020; font-weight: bold; font-size: 13px; display: inline-block; animation: pulse 1s infinite; }
+@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+.mensajes { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 8px; }
+.msg { max-width: 65%; padding: 8px 12px; border-radius: 8px; font-size: 14px; line-height: 1.4; position: relative; word-break: break-word; }
+.msg.cliente { background: #fff; align-self: flex-start; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); }
+.msg.vendedor, .msg.bot { background: #d9fdd3; align-self: flex-end; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); }
+.msg .ts { font-size: 11px; color: #999; text-align: right; margin-top: 4px; }
+.input-area { padding: 12px; background: #f0f2f5; display: flex; gap: 8px; align-items: center; border-top: 1px solid #ddd; }
+.input-area textarea { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 8px; resize: none; height: 20px; font-family: inherit; font-size: 14px; }
+.input-area button { background: #00a884; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+.input-area button:hover { background: #008f72; }
+.respuestas-rapidas { padding: 8px 12px; background: #e9edef; display: flex; gap: 6px; overflow-x: auto; border-top: 1px solid #ddd; }
+.chip { background: #fff; border: 1px solid #d1d7db; border-align: center; border-radius: 16px; padding: 6px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.chip:hover { background: #f0f2f5; }
+.info-bar { padding: 8px 16px; background: #fff; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: #666; }
+</style>
+</head>
+<body>
+<div id="lista">
+    <div class="header">📋 Chats <a href="/logout" style="font-size:12px;color:#00a884;text-decoration:none">Salir</a></div>
+    <div class="conversaciones" id="conversaciones"></div>
 </div>
-<div id="modal" class="oculto"><div class="caja"><div id="reporteCuerpo"></div><p><button id="cerrarModal">Cerrar</button></p></div></div>
-<div id="toast" class="oculto"></div>
+<div id="chat">
+    <div class="header" id="chat-header">Seleccioná un chat a la izquierda</div>
+    <div class="info-bar" id="info-bar" style="display:none">
+        <span id="estado-humano">Atendido por el bot</span>
+        <button id="btn-toggle" onclick="toggleHumano()" style="padding:4px 8px;font-size:12px;cursor:pointer"></button>
+    </div>
+    <div class="mensajes" id="mensajes"></div>
+    <div class="respuestas-rapidas" id="chips"></div>
+    <div class="input-area" id="input-area" style="display:none">
+        <textarea id="texto" placeholder="Escribí una respuesta..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();enviar();}"></textarea>
+        <button onclick="enviar()">Enviar</button>
+    </div>
+</div>
 <script nonce="__NONCE__">
-(() => {
-"use strict";
-const $ = id => document.getElementById(id);
-const el = (tag, cls, txt) => {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (txt !== undefined && txt !== null) e.textContent = txt;
-  return e;
-};
-const vaciar = n => { while (n.firstChild) n.removeChild(n.firstChild); };
-const norm = s => (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+let actual = null;
+let chats = [];
 
-let actual = null, datosLista = [], pintados = new Map(), previo = null;
-let sonidoOn = false, audioCtx = null, ventanaAbierta = true, enviando = false, cargandoChat = false;
-try { sonidoOn = localStorage.getItem("sonido") === "1"; } catch (e) {}
-
-let toastTimer = null;
-function toast(texto, malo) {
-  const t = $("toast");
-  t.textContent = texto;
-  t.className = malo ? "malo" : "";
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.className = "oculto"; }, 6000);
-}
-
-async function api(url, opts) {
-  const r = await fetch(url, opts);
-  if (r.status === 401) { location.reload(); throw new Error("sin sesión"); }
-  let data = null;
-  try { data = await r.json(); } catch (e) { data = null; }
-  return { ok: r.ok, status: r.status, data };
+async function cargarChats() {
+    try {
+        let r = await fetch('/api/chats');
+        if (!r.ok) return;
+        chats = await r.json();
+        let html = '';
+        for (let c of chats) {
+            let activo = c.numero === actual ? ' activo' : '';
+            let badge = c.no_leidos > 0 ? `<span class="badge">${c.no_leidos}</span>` : '';
+            let campana = c.pide_vendedor ? `<span class="campana">🔔</span> ` : '';
+            let nombre = c.nombre ? `${c.nombre} (${c.numero})` : c.numero;
+            html += `<div class="item${activo}" onclick="sel('${c.numero}')">
+                <div>
+                    <div class="num">${campana}${nombre}</div>
+                    <div class="txt">${c.ult_texto || ''}</div>
+                </div>
+                <div>${badge}</div>
+            </div>`;
+        }
+        document.getElementById('conversaciones').innerHTML = html;
+    } catch(e) {}
 }
 
-/* ---------- aviso sonoro ---------- */
-function iniciarAudio() {
-  if (audioCtx) return;
-  try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; }
+async function sel(num) {
+    actual = num;
+    document.getElementById('info-bar').style.display = 'flex';
+    document.getElementById('input-area').style.display = 'flex';
+    await cargarMensajes();
+    cargarChats();
 }
-function pitido() {
-  if (!sonidoOn || !audioCtx) return;
-  try {
-    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-    o.type = "sine"; o.frequency.value = 880; g.gain.value = 0.15;
-    o.connect(g); g.connect(audioCtx.destination);
-    o.start(); o.stop(audioCtx.currentTime + 0.25);
-  } catch (e) {}
-}
-function pintarBotonSonido() { $("btnSonido").textContent = sonidoOn ? "🔔 Sonido: sí" : "🔕 Sonido: no"; }
-$("btnSonido").addEventListener("click", () => {
-  sonidoOn = !sonidoOn;
-  try { localStorage.setItem("sonido", sonidoOn ? "1" : "0"); } catch (e) {}
-  if (sonidoOn) { iniciarAudio(); pitido(); }
-  pintarBotonSonido();
-});
-document.addEventListener("click", iniciarAudio, { once: true });
-pintarBotonSonido();
 
-/* ---------- lista de conversaciones ---------- */
-async function cargarLista() {
-  const r = await api("/api/conversaciones");
-  if (!r.ok || !Array.isArray(r.data)) return;
-  datosLista = r.data;
-  const pend = datosLista.filter(c => c.pide_vendedor).length;
-  const aAtender = datosLista.filter(c => c.humano).reduce((s, c) => s + c.no_leidos, 0);
-  document.title = (pend ? "(" + pend + ") 🔔 " : "") + "Panel Ferretería";
-  if (previo && (pend > previo.pend || aAtender > previo.aAtender)) pitido();
-  previo = { pend, aAtender };
-  $("cuentaPend").textContent = pend ? "(" + pend + ")" : "";
-  pintarLista();
-}
-function pintarLista() {
-  const q = norm($("buscar").value.trim());
-  const solo = $("soloPend").checked;
-  const caja = $("lista");
-  vaciar(caja);
-  const filas = datosLista.filter(c => (!solo || c.pide_vendedor) && (!q || norm(c.titulo + " " + c.numero).includes(q)));
-  if (!filas.length) {
-    caja.appendChild(el("div", "vacio", datosLista.length ? "No hay resultados." : "Todavía no hay mensajes."));
-    return;
-  }
-  filas.forEach(c => {
-    const item = el("div", "item" + (c.pide_vendedor ? " pide" : "") + (c.numero === actual ? " sel" : ""));
-    const f1 = el("div", "fila");
-    const izq = el("span", "num", c.titulo);
-    if (c.no_leidos) izq.appendChild(el("span", "badge", String(c.no_leidos)));
-    f1.appendChild(izq);
-    f1.appendChild(el("span", "hora", c.hora));
-    item.appendChild(f1);
-    let marca = "";
-    if (c.pide_vendedor) marca = "🔔 Espera" + (c.espera_min ? " hace " + c.espera_min + " min" : "") + " · ";
-    else if (c.humano) marca = "👤 ";
-    item.appendChild(el("div", "prev", marca + c.texto));
-    item.addEventListener("click", () => abrir(c.numero));
-    caja.appendChild(item);
-  });
-}
-$("buscar").addEventListener("input", pintarLista);
-$("soloPend").addEventListener("change", pintarLista);
+async function cargarMensajes() {
+    if (!actual) return;
+    try {
+        let r = await fetch(`/api/mensajes/${actual}`);
+        if (!r.ok) return;
+        let data = await r.json();
+        
+        let c = chats.find(x => x.numero === actual);
+        if (c) {
+            let nombre = c.nombre ? `${c.nombre} (${c.numero})` : c.numero;
+            document.getElementById('chat-header').innerText = nombre;
+            let humano = c.humano;
+            document.getElementById('estado-humano').innerText = humano ? "👤 Atendido por una persona (bot silenciado)" : "🤖 Atendido por el bot";
+            let btn = document.getElementById('btn-toggle');
+            btn.innerText = humano ? "Volver a activar Bot" : "Pasar a Humano";
+            btn.style.background = humano ? "#25d366" : "#b00020";
+            btn.style.color = "#fff";
+            btn.style.border = "none";
+            btn.style.borderRadius = "4px";
+        }
 
-/* ---------- conversación abierta ---------- */
-function abrir(numero) {
-  actual = numero;
-  pintados = new Map();
-  vaciar($("msgs"));
-  $("main").classList.add("abierto");
-  $("vacio").classList.add("oculto");
-  $("panelChat").classList.remove("oculto");
-  cargarChat(true).catch(() => {});
-  pintarLista();
+        let html = '';
+        for (let m of data.mensajes) {
+            let contenido = escapeHtml(m.texto);
+            if (m.archivo) {
+                if (m.archivo.startsWith('c/')) {
+                    let fotoUrl = '/catalogo/' + m.archivo.substring(2);
+                    contenido += `<br><img src="${fotoUrl}" style="max-width:200px;border-radius:6px;margin-top:6px">`;
+                } else if (m.archivo.startsWith('m/')) {
+                    let mediaUrl = '/media/' + m.archivo.substring(2);
+                    if (m.tipo === 'image') contenido += `<br><img src="${mediaUrl}" style="max-width:200px;border-radius:6px;margin-top:6px">`;
+                    else contenido += `<br><a href="${mediaUrl}" target="_blank">📄 Ver archivo adjunto</a>`;
+                }
+            }
+            html += `<div class="msg ${m.quien}">
+                <div>${contenido}</div>
+                <div class="ts">${m.ts_fmt}</div>
+            </div>`;
+        }
+        let box = document.getElementById('mensajes');
+        let abajo = box.scrollTop + box.clientHeight >= box.scrollHeight - 50;
+        box.innerHTML = html;
+        if (abajo) box.scrollTop = box.scrollHeight;
+    } catch(e) {}
 }
-function actualizarControles() {
-  $("texto").disabled = !ventanaAbierta || enviando;
-  $("enviar").disabled = !ventanaAbierta || enviando;
-  $("inputArchivo").disabled = !ventanaAbierta || enviando;
-}
-const NOMBRES = { cliente: "Cliente", bot: "Bot", vendedor: "Vendedor" };
-function pintarMensaje(m, box) {
-  const b = el("div", "msg " + m.quien);
-  b.appendChild(el("span", "etq", NOMBRES[m.quien] || m.quien));
-  if (m.archivo) {
-    if (m.tipo === "image" || m.tipo === "sticker") {
-      const img = el("img", "foto");
-      img.src = m.archivo; img.alt = "Imagen"; img.loading = "lazy";
-      img.addEventListener("click", () => window.open(m.archivo, "_blank", "noopener"));
-      b.appendChild(img);
-    } else if (m.tipo === "audio") {
-      const a = el("audio"); a.controls = true; a.preload = "none"; a.src = m.archivo; b.appendChild(a);
-    } else if (m.tipo === "video") {
-      const v = el("video", "video"); v.controls = true; v.preload = "metadata"; v.src = m.archivo; b.appendChild(v);
-    } else {
-      const a = el("a", "archivo", "📎 " + (m.nombre_archivo || "Archivo"));
-      a.href = m.archivo; a.target = "_blank"; a.rel = "noopener";
-      a.setAttribute("download", m.nombre_archivo || "archivo");
-      b.appendChild(a);
-    }
-  }
-  if (m.texto) b.appendChild(el("div", "cuerpo", m.texto));
-  const pie = el("small", "pie");
-  pie.appendChild(document.createTextNode(m.hora + " "));
-  const tick = el("span", "tick");
-  pie.appendChild(tick);
-  b.appendChild(pie);
-  const err = el("div", "falla oculto");
-  b.appendChild(err);
-  const refs = { tick, err, estado: null };
-  actualizarMensaje(refs, m);
-  pintados.set(m.id, refs);
-  box.appendChild(b);
-}
-function actualizarMensaje(refs, m) {
-  const clave = m.estado + "|" + m.error;
-  if (refs.estado === clave) return;
-  refs.estado = clave;
-  if (m.quien === "cliente") return;
-  refs.tick.className = "tick" + (m.estado === "read" ? " leido" : "");
-  refs.tick.textContent = m.estado === "read" || m.estado === "delivered" ? "✓✓" : (m.estado === "sent" ? "✓" : "");
-  if (m.estado === "failed") {
-    refs.tick.textContent = "⚠️";
-    refs.err.textContent = "No se entregó: " + (m.error || "error desconocido");
-    refs.err.classList.remove("oculto");
-  } else {
-    refs.err.classList.add("oculto");
-  }
-}
-async function cargarChat(bajar) {
-  if (!actual || cargandoChat) return;
-  cargandoChat = true;
-  const num = actual;
-  try {
-    const r = await api("/api/conversaciones/" + num);
-    if (!r.ok || num !== actual) return;
-    const d = r.data;
-    $("titulo").textContent = d.titulo;
-    const inp = $("inputNombre");
-    if (document.activeElement !== inp) inp.value = d.nombre || "";
-    $("estado").textContent = d.humano ? "👤 Atiende una persona" : "🤖 Atiende el bot";
-    $("devolver").classList.toggle("oculto", !d.humano);
-    ventanaAbierta = d.ventana;
-    $("avisoVentana").classList.toggle("oculto", d.ventana);
-    actualizarControles();
-    const box = $("msgs");
-    const abajo = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    let nuevos = false;
-    d.mensajes.forEach(m => {
-      const ya = pintados.get(m.id);
-      if (ya) { actualizarMensaje(ya, m); } else { pintarMensaje(m, box); nuevos = true; }
+
+async function enviar(txt) {
+    let texto = txt || document.getElementById('texto').value.trim();
+    if (!texto || !actual) return;
+    if (!txt) document.getElementById('texto').value = '';
+    await fetch('/api/enviar', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({numero: actual, texto: texto})
     });
-    if (nuevos && (abajo || bajar)) box.scrollTop = box.scrollHeight;
-  } finally { cargandoChat = false; }
+    cargarMensajes();
+    cargarChats();
 }
 
-/* ---------- enviar ---------- */
-async function enviar() {
-  const t = $("texto").value.trim();
-  if (!t || !actual || enviando) return;
-  enviando = true; actualizarControles();
-  try {
-    const r = await api("/api/enviar", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ numero: actual, texto: t })
+async function toggleHumano() {
+    if (!actual) return;
+    let c = chats.find(x => x.numero === actual);
+    if (!c) return;
+    let nuevo = c.humano ? 0 : 1;
+    await fetch('/api/humano', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({numero: actual, humano: nuevo})
     });
-    if (r.ok && r.data && r.data.ok) { $("texto").value = ""; }
-    else { toast("No se pudo enviar: " + ((r.data && r.data.error) || "error desconocido"), true); }
-  } catch (e) { if (e.message !== "sin sesión") toast("Error de conexión. Probá de nuevo.", true); }
-  enviando = false; actualizarControles();
-  cargarChat(true).catch(() => {}); cargarLista().catch(() => {});
+    cargarChats();
+    cargarMensajes();
 }
-function reducirImagen(file) {
-  return new Promise(resolve => {
-    if (!file.type.startsWith("image/")) return resolve(file);
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const esc = Math.min(1, 1600 / Math.max(img.width, img.height));
-      const c = document.createElement("canvas");
-      c.width = Math.max(1, Math.round(img.width * esc));
-      c.height = Math.max(1, Math.round(img.height * esc));
-      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-      c.toBlob(b => resolve(b || file), "image/jpeg", 0.85);
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
-    img.src = url;
-  });
-}
-async function enviarArchivo() {
-  const inp = $("inputArchivo");
-  if (!inp.files.length || !actual || enviando) return;
-  const f = inp.files[0];
-  inp.value = "";
-  enviando = true; actualizarControles();
-  try {
-    const blob = await reducirImagen(f);
-    const fd = new FormData();
-    fd.append("numero", actual);
-    fd.append("texto", $("texto").value.trim());
-    fd.append("archivo", blob, f.type.startsWith("image/") ? "foto.jpg" : (f.name || "archivo.pdf"));
-    const r = await api("/api/enviar_archivo", { method: "POST", body: fd });
-    if (r.ok && r.data && r.data.ok) { $("texto").value = ""; }
-    else { toast("No se pudo enviar el archivo: " + ((r.data && r.data.error) || "error desconocido"), true); }
-  } catch (e) { if (e.message !== "sin sesión") toast("Error de conexión al enviar el archivo.", true); }
-  enviando = false; actualizarControles();
-  cargarChat(true).catch(() => {}); cargarLista().catch(() => {});
-}
-async function guardarNombre() {
-  if (!actual) return;
-  const r = await api("/api/guardar_nombre", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ numero: actual, nombre: $("inputNombre").value.trim() })
-  });
-  if (r.ok) { toast("Nombre guardado"); cargarChat(false).catch(() => {}); cargarLista().catch(() => {}); }
-  else { toast("No se pudo guardar el nombre.", true); }
-}
-async function devolver() {
-  if (!actual) return;
-  await api("/api/devolver_bot", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ numero: actual })
-  });
-  cargarChat(false).catch(() => {}); cargarLista().catch(() => {});
-}
-$("enviar").addEventListener("click", enviar);
-$("inputArchivo").addEventListener("change", enviarArchivo);
-$("guardarNombre").addEventListener("click", guardarNombre);
-$("inputNombre").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); guardarNombre(); } });
-$("devolver").addEventListener("click", devolver);
-$("texto").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } });
-$("atras").addEventListener("click", () => {
-  actual = null;
-  $("main").classList.remove("abierto");
-  $("panelChat").classList.add("oculto");
-  $("vacio").classList.remove("oculto");
-  pintarLista();
-});
 
-/* ---------- reporte semanal ---------- */
-function bloqueLista(cuerpo, titulo, filas, vacio) {
-  cuerpo.appendChild(el("h3", "", titulo));
-  if (!filas.length) { cuerpo.appendChild(el("p", "suave", vacio)); return; }
-  const ul = el("ul");
-  filas.forEach(f => ul.appendChild(el("li", "", f.texto + " — " + f.n)));
-  cuerpo.appendChild(ul);
+function escapeHtml(text) {
+    return (text || '').replace(/&/g, "&").replace(/</g, "<").replace(/>/g, ">");
 }
-async function verReporte() {
-  const cuerpo = $("reporteCuerpo");
-  vaciar(cuerpo);
-  const r = await api("/api/reporte?dias=7");
-  if (!r.ok || !r.data) { cuerpo.appendChild(el("p", "", "No se pudo cargar el reporte.")); }
-  else {
-    const d = r.data;
-    cuerpo.appendChild(el("h2", "", "📊 Últimos " + d.dias + " días"));
-    const cifras = el("div", "cifras");
-    [["Clientes nuevos", d.conversaciones_nuevas], ["Mensajes recibidos", d.mensajes_clientes], ["Derivados a vendedor", d.derivaciones]].forEach(([t, n]) => {
-      const c = el("div", "cifra"); c.appendChild(el("b", "", String(n))); c.appendChild(document.createTextNode(t)); cifras.appendChild(c);
-    });
-    cuerpo.appendChild(cifras);
-    bloqueLista(cuerpo, "Por qué se derivó a un vendedor", d.motivos, "Todavía no hubo derivaciones.");
-    bloqueLista(cuerpo, "Productos más consultados", d.productos, "Todavía no consultaron productos del catálogo.");
-    bloqueLista(cuerpo, "Lo que el bot no entendió (ideas para agregar)", d.sin_entender, "Nada por ahora.");
-    bloqueLista(cuerpo, "Mensajes de clientes por día", d.por_dia, "Sin datos.");
-  }
-  $("modal").classList.remove("oculto");
-}
-$("btnReporte").addEventListener("click", () => { verReporte().catch(() => {}); });
-$("cerrarModal").addEventListener("click", () => $("modal").classList.add("oculto"));
-$("modal").addEventListener("click", e => { if (e.target === $("modal")) $("modal").classList.add("oculto"); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") $("modal").classList.add("oculto"); });
 
-/* ---------- arranque ---------- */
-api("/api/config").then(r => {
-  if (!r.ok || !r.data) return;
-  const caja = $("rapidas");
-  (r.data.rapidas || []).forEach(t => {
-    const b = el("button", "chip", t.length > 30 ? t.slice(0, 30) + "…" : t);
-    b.title = t;
-    b.addEventListener("click", () => {
-      const ta = $("texto");
-      ta.value = (ta.value ? ta.value + " " : "") + t;
-      ta.focus();
-    });
-    caja.appendChild(b);
-  });
-  if (!caja.children.length) caja.classList.add("oculto");
-}).catch(() => {});
-cargarLista().catch(() => {});
-setInterval(() => { cargarLista().catch(() => {}); cargarChat(false).catch(() => {}); }, 4000);
-})();
+async function cargarRespuestasRapidas() {
+    try {
+        let r = await fetch('/api/respuestas');
+        if (!r.ok) return;
+        let resp = await r.json();
+        let html = '';
+        for (let t of resp) {
+            html += `<div class="chip" onclick="enviar('${t.replace(/'/g, "\\'")}')">${t}</div>`;
+        }
+        document.getElementById('chips').innerHTML = html;
+    } catch(e) {}
+}
+
+setInterval(() => {
+    cargarChats();
+    if (actual) cargarMensajes();
+}, 4000);
+
+cargarChats();
+cargarRespuestasRapidas();
 </script>
-</body></html>"""
+</body>
+</html>
+"""
 
 
-@app.route("/panel")
+@app.route("/panel/", methods=["GET"])
 def panel():
+    if not PANEL_PASSWORD:
+        return "El panel está desactivado (falta PANEL_PASSWORD en Render)", 403
     if not session.get("ok"):
         return pagina_login(), 200
     nonce = secrets.token_urlsafe(16)
@@ -1608,6 +1053,98 @@ def panel():
     return resp
 
 
+@app.route("/login", methods=["POST"])
+def login():
+    ip = request.remote_addr or "127.0.0.1"
+    if bloqueado(ip):
+        return pagina_login("Demasiados intentos fallidos. Esperá 5 minutos."), 429
+    clave = request.form.get("clave", "")
+    if PANEL_PASSWORD and hmac.compare_digest(clave, PANEL_PASSWORD):
+        INTENTOS.pop(ip, None)
+        session.permanent = True
+        session["ok"] = True
+        return redirect("/panel/")
+    fallos, _ = INTENTOS.get(ip, (0, time.time()))
+    INTENTOS[ip] = (fallos + 1, time.time())
+    return pagina_login("Clave incorrecta"), 403
+
+
+@app.route("/logout", methods=["GET"])
+def logout():
+    session.clear()
+    return redirect("/panel/")
+
+
+@app.route("/api/chats", methods=["GET"])
+def api_chats():
+    if not session.get("ok"):
+        return jsonify({"error": "no autorizado"}), 401
+    with tx() as con:
+        filas = con.execute("SELECT * FROM conversaciones ORDER BY ultimo DESC").fetchall()
+    return jsonify([dict(f) for f in filas])
+
+
+@app.route("/api/mensajes/<numero>", methods=["GET"])
+def api_mensajes(numero):
+    if not session.get("ok"):
+        return jsonify({"error": "no autorizado"}), 401
+    with tx() as con:
+        con.execute("UPDATE conversaciones SET no_leidos=0 WHERE numero=?", (numero,))
+        filas = con.execute("SELECT * FROM mensajes WHERE numero=? ORDER BY id ASC", (numero,)).fetchall()
+    res = []
+    for f in filas:
+        d = dict(f)
+        d["ts_fmt"] = fmt(d["ts"])
+        res.append(d)
+    return jsonify({"mensajes": res})
+
+
+@app.route("/api/enviar", methods=["POST"])
+def api_enviar():
+    if not session.get("ok"):
+        return jsonify({"error": "no autorizado"}), 401
+    d = request.get_json(silent=True) or {}
+    numero, texto = str(d.get("numero", "")), str(d.get("texto", "")).strip()
+    if not numero_valido(numero) or not texto:
+        return jsonify({"error": "datos inválidos"}), 400
+    with lock_de(numero):
+        ok, wamid, error = enviar_texto(numero, texto)
+        registrar(numero, "vendedor", "text", texto, wamid=wamid, estado="sent" if ok else "failed", error=error)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/humano", methods=["POST"])
+def api_humano():
+    if not session.get("ok"):
+        return jsonify({"error": "no autorizado"}), 401
+    d = request.get_json(silent=True) or {}
+    numero, humano = str(d.get("numero", "")), int(d.get("humano", 0))
+    if not numero_valido(numero):
+        return jsonify({"error": "número inválido"}), 400
+    marcar(numero, humano=humano, pide_vendedor=0, fallos=0)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/respuestas", methods=["GET"])
+def api_respuestas():
+    if not session.get("ok"):
+        return jsonify({"error": "no autorizado"}), 401
+    return jsonify(RESPUESTAS_RAPIDAS)
+
+
+@app.route("/media/<path:nombre>", methods=["GET"])
+def servir_media(nombre):
+    if not session.get("ok"):
+        abort(401)
+    seguro = secure_filename(nombre)
+    return send_file(os.path.join(MEDIA_DIR, seguro))
+
+
+@app.route("/catalogo/<path:nombre>", methods=["catalogo", "GET"])
+def servir_catalogo(nombre):
+    seguro = secure_filename(nombre)
+    return send_file(os.path.join(CATALOGO_DIR, seguro))
+
+
 if __name__ == "__main__":
-    # Solo para probar en tu compu. En Render se usa gunicorn.
-    app.run(port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
