@@ -1,4 +1,4 @@
 flask
 requests
 gunicorn
-sycopg2-binary
+psycopg2-binary
