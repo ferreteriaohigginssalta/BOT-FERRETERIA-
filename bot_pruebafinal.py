@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 6: ajustes desde el panel + usuarios + copias)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 7: fotos en la lista de productos + pedido/carrito + presupuesto)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -257,6 +257,21 @@ CREATE TABLE IF NOT EXISTS eventos (
 );
 CREATE INDEX IF NOT EXISTS idx_eventos_ts ON eventos (ts);
 CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS carrito (
+    id       __ID__,
+    numero   TEXT NOT NULL,
+    clave    TEXT NOT NULL DEFAULT '',
+    nombre   TEXT NOT NULL,
+    cantidad TEXT NOT NULL DEFAULT '',
+    ts       DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_carrito_numero ON carrito (numero);
+CREATE TABLE IF NOT EXISTS pedidos (
+    id     __ID__,
+    numero TEXT NOT NULL,
+    items  TEXT NOT NULL,
+    ts     DOUBLE PRECISION NOT NULL
+);
 CREATE TABLE IF NOT EXISTS usuarios (
     usuario    TEXT PRIMARY KEY,
     nombre     TEXT NOT NULL DEFAULT '',
@@ -382,7 +397,9 @@ def iniciar_db():
             con.execute(SCHEMA_ARCHIVOS_PG)
         _agregar_columna(con, "mensajes", "autor", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "atiende", "TEXT NOT NULL DEFAULT ''")
+        _agregar_columna(con, "conversaciones", "espera", "TEXT NOT NULL DEFAULT ''")
         con.execute("DELETE FROM vistos WHERE ts < ?", (time.time() - 3 * 86400,))
+        con.execute("DELETE FROM carrito WHERE ts < ?", (time.time() - 7 * 86400,))
     log.info("Base de datos lista (%s)", "Supabase" if USA_PG else DB_PATH)
 
 
@@ -918,19 +935,38 @@ def enviar_texto(numero, texto):
     })
 
 
-def enviar_botones(numero, cuerpo):
-    botones = [
-        ("horarios", "🕒 Horarios"),
-        ("productos", "🧱 Productos"),
-        ("vendedor", "👤 Vendedor"),
-    ]
+BTN_MENU = [("horarios", "🕒 Horarios"), ("productos", "🧱 Productos"), ("vendedor", "👤 Vendedor")]
+BTN_AGREGADO = [("productos", "➕ Seguir agregando"), ("carrito", "🛒 Ver pedido"), ("pedir", "📋 Pedir presupuesto")]
+BTN_PEDIDO = [("pedir", "📋 Pedir presupuesto"), ("productos", "➕ Seguir agregando"), ("vaciar", "🗑 Vaciar pedido")]
+BTN_ARMAR = [("productos", "🧱 Ver productos"), ("otro", "✍️ Escribir pedido"), ("vendedor", "👤 Vendedor")]
+
+
+def _payload_botones(numero, cuerpo, botones, imagen_id=None):
+    inter = {
+        "type": "button",
+        "body": {"text": cuerpo[:1024]},
+        "action": {"buttons": [
+            {"type": "reply", "reply": {"id": i[:200], "title": t[:20]}} for i, t in botones[:3]
+        ]},
+    }
+    if imagen_id:
+        inter["header"] = {"type": "image", "image": {"id": imagen_id}}
+    return {"messaging_product": "whatsapp", "to": a_destino(numero), "type": "interactive", "interactive": inter}
+
+
+def enviar_botones(numero, cuerpo, botones=None, imagen_id=None):
+    return meta_post(_payload_botones(numero, cuerpo, botones or BTN_MENU, imagen_id))
+
+
+def enviar_lista(numero, cuerpo, boton, filas):
+    """Lista desplegable de WhatsApp (hasta 10 filas)."""
     return meta_post({
         "messaging_product": "whatsapp", "to": a_destino(numero), "type": "interactive",
         "interactive": {
-            "type": "button",
+            "type": "list",
             "body": {"text": cuerpo[:1024]},
-            "action": {"buttons": [
-                {"type": "reply", "reply": {"id": i, "title": t}} for i, t in botones
+            "action": {"button": boton[:20], "sections": [
+                {"title": "Productos", "rows": [{"id": f["id"][:200], "title": f["title"][:24]} for f in filas[:10]]}
             ]},
         },
     })
@@ -973,7 +1009,8 @@ def _bytes_foto(origen, foto):
     return leer_catalogo(ruta), mime_por_extension(ruta)
 
 
-def enviar_foto(numero, origen, foto, texto):
+def enviar_foto(numero, origen, foto, texto, botones=None):
+    """Foto con texto. Si se pasan botones, va como tarjeta: foto arriba, texto y botones abajo."""
     datos, mime = _bytes_foto(origen, foto)
     if not datos or not mime:
         return False, "", "no hay foto"
@@ -988,10 +1025,13 @@ def enviar_foto(numero, origen, foto, texto):
             if not media_id:
                 return False, "", error
             MEDIA_IDS[clave] = (media_id, time.time())
-        ok, wamid, error = meta_post({
-            "messaging_product": "whatsapp", "to": a_destino(numero), "type": "image",
-            "image": {"id": media_id, "caption": texto[:1024]},
-        })
+        if botones:
+            ok, wamid, error = meta_post(_payload_botones(numero, texto, botones, media_id))
+        else:
+            ok, wamid, error = meta_post({
+                "messaging_product": "whatsapp", "to": a_destino(numero), "type": "image",
+                "image": {"id": media_id, "caption": texto[:1024]},
+            })
         if ok:
             return True, wamid, ""
         MEDIA_IDS.pop(clave, None)  # por si Meta ya la borró: la volvemos a subir
@@ -1016,18 +1056,43 @@ def decir_menu(numero, intro):
     decir(numero, intro + "\n\n" + MENU_ESCRITO)
 
 
+def decir_botones(numero, cuerpo, botones, alternativa=""):
+    """Mensaje con botones. Si Meta no los acepta, manda el texto solo."""
+    ok, wamid, error = enviar_botones(numero, cuerpo, botones)
+    if ok:
+        registrar(numero, "bot", "text", cuerpo + "\n🔘 " + " · ".join(t for _, t in botones),
+                  wamid=wamid, estado="sent")
+        return True
+    log.warning("Los botones no funcionaron (%s): mando solo el texto", error)
+    return decir(numero, cuerpo + (("\n\n" + alternativa) if alternativa else ""))
+
+
+def botones_producto(p):
+    return [("add:" + p["clave"], "➕ Agregar al pedido"), ("productos", "🧱 Ver productos"), ("vendedor", "👤 Vendedor")]
+
+
 def enviar_producto(numero, p):
+    """Foto + descripción + botón para sumarlo al pedido."""
     texto = p["texto"] or (
         f"🧰 *{p['nombre']}*\n\nPara consultar stock, medidas o precio, escribí *VENDEDOR*."
     )
+    botones = botones_producto(p)
+    alternativa = "Para armar tu pedido escribí *PEDIDO*."
     if p["foto"]:
+        ok, wamid, error = enviar_foto(numero, p["origen"], p["foto"], texto, botones)
+        if ok:
+            registrar(numero, "bot", "image", texto + "\n🔘 " + " · ".join(t for _, t in botones),
+                      archivo=f"{p['origen']}/{p['foto']}", wamid=wamid, estado="sent")
+            return
+        log.warning("La tarjeta con foto de %s falló (%s): pruebo con foto simple", p["foto"], error)
         ok, wamid, error = enviar_foto(numero, p["origen"], p["foto"], texto)
         if ok:
             registrar(numero, "bot", "image", texto, archivo=f"{p['origen']}/{p['foto']}",
                       wamid=wamid, estado="sent")
+            decir_botones(numero, "¿Lo sumamos a tu pedido?", botones, alternativa)
             return
         log.warning("No pude mandar la foto %s (%s): mando solo el texto", p["foto"], error)
-    decir(numero, texto)
+    decir_botones(numero, texto, botones, alternativa)
 
 
 # =====================================================================
@@ -1039,8 +1104,7 @@ PALABRAS_VENDEDOR = (
 )
 PALABRAS_PRECIO = (
     "precio", "precios", "cuanto sale", "cuanto salen", "cuanto cuesta", "cuanto cuestan",
-    "cuanto vale", "cuanto esta", "cuanto me sale", "presupuesto", "presupuestos", "cotizacion",
-    "cotizar", "costo",
+    "cuanto vale", "cuanto esta", "cuanto me sale", "costo",
 )
 PALABRAS_HORARIOS = ("horario", "horarios", "hora", "abren", "abre", "abierto", "abiertos",
                      "cierran", "cierra", "atienden")
@@ -1054,6 +1118,198 @@ PALABRAS_MENU = ("menu", "opciones", "ayuda", "inicio", "info", "informacion")
 PALABRAS_SALUDO = ("hola", "buenas", "buen dia", "buenos dias", "buenas tardes", "buenas noches", "hey")
 PALABRAS_GRACIAS = ("gracias", "muchas gracias", "mil gracias")
 BOTONES = {"horarios": "horarios", "productos": "productos", "vendedor": "vendedor"}
+PALABRAS_PRESUPUESTO = ("presupuesto", "presupuestos", "cotizacion", "cotizar")
+PALABRAS_PEDIDO = ("mi pedido", "ver pedido", "pedido", "carrito", "mi carrito")
+PALABRAS_CANCELAR = ("no", "nada", "cancelar", "cancelo", "cancela", "olvidalo", "dejalo", "salir")
+NUMEROS = {"un", "uno", "una", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve", "diez",
+           "once", "doce", "quince", "veinte", "treinta", "cuarenta", "cincuenta", "cien", "medio", "media",
+           "docena", "varios", "varias"}
+UNIDADES = {"bolsa", "caja", "metro", "kilo", "litro", "unidad", "rollo", "par", "bidon", "lata", "m", "kg", "lt", "mt"}
+MAX_ITEMS_PEDIDO = 30
+ESPERA_VENCE = 20 * 60  # si el cliente no contesta la cantidad en 20 minutos, se olvida
+
+
+# ---- pedido (carrito) del cliente: no tiene precios; el presupuesto lo arma una persona
+def tiene_cantidad(t):
+    return bool(re.search(r"\d", t)) or any(w in NUMEROS or raiz(w) in UNIDADES for w in t.split())
+
+
+def carrito_items(numero):
+    with tx() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT clave, nombre, cantidad FROM carrito WHERE numero=? ORDER BY id", (numero,)).fetchall()]
+
+
+def carrito_agregar(numero, clave, nombre, cantidad):
+    with tx() as con:
+        n = con.execute("SELECT COUNT(*) AS n FROM carrito WHERE numero=?", (numero,)).fetchone()["n"]
+        if n >= MAX_ITEMS_PEDIDO:
+            return False
+        con.execute("INSERT INTO carrito (numero, clave, nombre, cantidad, ts) VALUES (?,?,?,?,?)",
+                    (numero, clave, nombre[:80], cantidad[:40], time.time()))
+    return True
+
+
+def carrito_vaciar(numero):
+    with tx() as con:
+        con.execute("DELETE FROM carrito WHERE numero=?", (numero,))
+
+
+def texto_items(items):
+    return "\n".join("• " + i["nombre"] + (f" — {i['cantidad']}" if i["cantidad"] else "") for i in items)
+
+
+def buscar_producto(clave):
+    return next((p for p in catalogo_actual() if p["clave"] == clave), None)
+
+
+def poner_espera(numero, tipo):
+    marcar(numero, espera=f"{tipo}@{int(time.time())}")
+
+
+def espera_vigente(c):
+    """Lo que el bot está esperando del cliente ('cant:clave' o 'libre'), o '' si no hay o venció."""
+    crudo = (c["espera"] if c else "") or ""
+    if "@" not in crudo:
+        return ""
+    tipo, _, ts = crudo.rpartition("@")
+    try:
+        return tipo if time.time() - int(ts) < ESPERA_VENCE else ""
+    except ValueError:
+        return ""
+
+
+def mostrar_productos(numero, pagina=0):
+    """Lista desplegable: el cliente toca un producto y recibe su foto y detalle."""
+    cat = catalogo_actual()
+    if not cat:
+        return decir(numero, "Para consultar por productos escribí *VENDEDOR*.")
+    por_pagina = 7
+    if len(cat) <= 9:
+        visibles, pagina, hay_mas = cat, 0, False
+    else:
+        ultima = (len(cat) - 1) // por_pagina
+        pagina = max(0, min(pagina, ultima))
+        visibles = cat[pagina * por_pagina:(pagina + 1) * por_pagina]
+        hay_mas = pagina < ultima
+    filas = [{"id": "prod:" + p["clave"], "title": p["nombre"]} for p in visibles]
+    if pagina > 0:
+        filas.append({"id": f"pag:{pagina - 1}", "title": "⬅️ Anteriores"})
+    if hay_mas:
+        filas.append({"id": f"pag:{pagina + 1}", "title": "➡️ Ver más"})
+    filas.append({"id": "otro", "title": "✍️ Otro producto"})
+    ok, wamid, error = enviar_lista(numero, "🧰 Elegí un producto para ver su foto y detalles 👇", "Ver productos", filas)
+    if ok:
+        registrar(numero, "bot", "text", f"🧰 Lista de productos ({len(cat)})\n🔘 Toca un producto para ver su foto",
+                  wamid=wamid, estado="sent")
+        return True
+    log.warning("La lista no funcionó (%s): mando los nombres escritos", error)
+    return decir(numero, texto_productos())
+
+
+def mostrar_carrito(numero):
+    items = carrito_items(numero)
+    if not items:
+        return decir_botones(numero, "🛒 Tu pedido está vacío todavía. Elegí productos o escribí lo que necesitás 👇",
+                             BTN_ARMAR, "Escribí *PRODUCTOS* para ver el catálogo.")
+    return decir_botones(
+        numero,
+        "🛒 *Tu pedido:*\n" + texto_items(items) +
+        "\n\nCuando esté listo, pedí el presupuesto y un vendedor te pasa los precios.",
+        BTN_PEDIDO, "Escribí *PRESUPUESTO* para pedirlo o *PRODUCTOS* para seguir agregando.")
+
+
+def ofrecer_armar_pedido(numero):
+    return decir_botones(
+        numero,
+        "📋 ¡Claro! Para el presupuesto armá tu pedido: elegí productos del catálogo o escribí lo que "
+        "necesitás. Un vendedor te pasa los precios.",
+        BTN_ARMAR, "Escribí *PRODUCTOS* para ver el catálogo o *VENDEDOR* para hablar con una persona.")
+
+
+def pedir_presupuesto(numero):
+    items = carrito_items(numero)
+    if not items:
+        return mostrar_carrito(numero)
+    resumen = texto_items(items)
+    with tx() as con:
+        con.execute("INSERT INTO pedidos (numero, items, ts) VALUES (?,?,?)",
+                    (numero, json.dumps(items, ensure_ascii=False), time.time()))
+    carrito_vaciar(numero)
+    marcar(numero, espera="")
+    derivar(numero, "presupuesto",
+            "✅ ¡Listo! Este es tu pedido:\n" + resumen +
+            "\n\n🔔 Se lo pasé a un vendedor, que te prepara el presupuesto con los precios actualizados "
+            "y te lo envía por acá.")
+
+
+def manejar_accion(numero, bid):
+    """Toques en la lista de productos y en los botones del pedido. Devuelve True si era uno de los nuestros."""
+    if bid.startswith("prod:"):
+        p = buscar_producto(bid[5:])
+        if p is None:
+            decir(numero, "Ese producto ya no está disponible.")
+            return mostrar_productos(numero) or True
+        evento("producto", p["clave"])
+        enviar_producto(numero, p)
+    elif bid.startswith("add:"):
+        p = buscar_producto(bid[4:])
+        if p is None:
+            decir(numero, "Ese producto ya no está disponible.")
+            return mostrar_productos(numero) or True
+        poner_espera(numero, "cant:" + p["clave"])
+        decir(numero, f"¿Cuánto querés de *{p['nombre']}*? Escribí la cantidad (ej: 2 bolsas, 10 unidades).\n"
+                      "Para cancelar escribí *CANCELAR*.")
+    elif bid.startswith("pag:"):
+        try:
+            mostrar_productos(numero, int(bid[4:]))
+        except ValueError:
+            mostrar_productos(numero)
+    elif bid == "otro":
+        poner_espera(numero, "libre")
+        decir(numero, "✍️ Escribime qué producto necesitás y la cantidad (ej: 10 metros de cable).\n"
+                      "Para cancelar escribí *CANCELAR*.")
+    elif bid == "carrito":
+        mostrar_carrito(numero)
+    elif bid == "vaciar":
+        carrito_vaciar(numero)
+        decir_botones(numero, "🗑 Listo, vaciaste tu pedido.", BTN_MENU, "Escribí *PRODUCTOS* si querés empezar de nuevo.")
+    elif bid == "pedir":
+        pedir_presupuesto(numero)
+    else:
+        return False
+    return True
+
+
+def manejar_espera(numero, texto, espera):
+    """El cliente estaba por decirnos una cantidad (o un producto que no está en el catálogo).
+    Devuelve True si este mensaje era esa respuesta; False si hay que atenderlo normalmente."""
+    t = normalizar(texto)
+    if not t or tiene(t, PALABRAS_VENDEDOR):
+        marcar(numero, espera="")
+        return False
+    if t in PALABRAS_CANCELAR:
+        marcar(numero, espera="")
+        decir_menu(numero, "Sin problema 👍")
+        return True
+    if espera.startswith("cant:"):
+        if not tiene_cantidad(t):
+            marcar(numero, espera="")  # no era una cantidad: lo atendemos como cualquier mensaje
+            return False
+        clave = espera[5:]
+        p = buscar_producto(clave)
+        nombre, cantidad = (p["nombre"] if p else clave), texto.strip()[:40]
+    else:  # "libre": un producto que todavía no está cargado en el catálogo
+        clave, nombre, cantidad = "", texto.strip()[:80], ""
+    marcar(numero, espera="")
+    if not carrito_agregar(numero, clave, nombre, cantidad):
+        decir(numero, "Tu pedido ya tiene muchos productos. Pedí el presupuesto y después seguimos 🙂")
+        mostrar_carrito(numero)
+        return True
+    evento("pedido_item", clave or "libre")
+    decir_botones(numero, f"✅ Agregué *{nombre}*" + (f" — {cantidad}" if cantidad else "") + " a tu pedido.",
+                  BTN_AGREGADO, "Escribí *PEDIDO* para ver tu pedido o *PRESUPUESTO* para pedirlo.")
+    return True
 
 
 def derivar(numero, motivo, mensaje):
@@ -1067,6 +1323,10 @@ def derivar(numero, motivo, mensaje):
 
 def responder(numero, texto, primer_mensaje):
     t = normalizar(texto)
+    c = conv(numero)
+    espera = espera_vigente(c)
+    if espera and manejar_espera(numero, texto, espera):
+        return
     prods = productos_en(t)
     aclarar = []
     if not prods:
@@ -1080,6 +1340,13 @@ def responder(numero, texto, primer_mensaje):
 
     if tiene(t, PALABRAS_VENDEDOR):
         return derivar(numero, "pedido", DERIVACION)
+    if tiene(t, PALABRAS_PEDIDO) and not prods:
+        return mostrar_carrito(numero)
+    if tiene(t, PALABRAS_PRESUPUESTO):
+        if carrito_items(numero):
+            return pedir_presupuesto(numero)
+        if not prods:
+            return ofrecer_armar_pedido(numero)
     if tiene(t, PALABRAS_PRECIO):
         return derivar(numero, "precio", DERIVACION_PRECIOS)
 
@@ -1117,7 +1384,7 @@ def responder(numero, texto, primer_mensaje):
         return
 
     if tiene(t, PALABRAS_PRODUCTOS):
-        decir(numero, texto_productos())
+        mostrar_productos(numero)
     elif tiene(t, PALABRAS_MENU) or tiene(t, PALABRAS_SALUDO):
         evento("saludo")
         decir_menu(numero, saludo_texto())
@@ -1225,7 +1492,7 @@ def procesar_mensaje(msg, perfil=""):
         return  # un 👍 del cliente no merece respuesta
 
     with lock_de(numero):
-        texto, entrada = "", ""
+        texto, entrada, accion = "", "", ""
         archivo, nombre_archivo, es_archivo, tipo_guardado = "", "", False, "text"
 
         if tipo == "text":
@@ -1234,7 +1501,14 @@ def procesar_mensaje(msg, perfil=""):
             inter = msg.get("interactive") or {}
             resp = inter.get("button_reply") or inter.get("list_reply") or {}
             texto = resp.get("title", "")
-            entrada = BOTONES.get(resp.get("id"), texto)
+            bid = resp.get("id", "")
+            if bid in BOTONES:
+                entrada = BOTONES[bid]
+            elif bid.split(":")[0] in ("prod", "add", "pag") or bid in ("otro", "carrito", "vaciar", "pedir"):
+                accion = bid
+                entrada = texto
+            else:
+                entrada = texto
         elif tipo in MEDIA_TIPOS:
             dato = msg.get(tipo) or {}
             texto = dato.get("caption", "")
@@ -1266,6 +1540,9 @@ def procesar_mensaje(msg, perfil=""):
                 derivar(numero, "archivo", DERIVACION_ARCHIVO)
             else:
                 decir_menu(numero, "Recibí tu archivo 🙂")
+            return
+        if accion:
+            manejar_accion(numero, accion)  # toques de botones: se contestan al instante
             return
         if tipo == "text" and ESPERA_JUNTAR > 0:
             encolar(numero, entrada)  # espera un instante por si manda más mensajes
@@ -1700,7 +1977,7 @@ def api_reporte():
     nombres_motivo = {
         "pedido": "Pidieron un vendedor", "precio": "Preguntaron precios", "archivo": "Mandaron foto/audio/archivo",
         "insistencia": "El bot no los entendió (2 veces)", "direccion": "Dirección (sin dato cargado)",
-        "pago": "Medios de pago (sin dato cargado)", "envio": "Envíos (sin dato cargado)",
+        "pago": "Medios de pago (sin dato cargado)", "presupuesto": "Pidieron presupuesto (pedido armado)", "envio": "Envíos (sin dato cargado)",
     }
     return jsonify({
         "dias": dias,
@@ -1863,7 +2140,7 @@ def api_backup():
     """Descarga todo (chats, productos, ajustes, reportes) en un archivo. No incluye fotos ni claves."""
     datos = {}
     with tx() as con:
-        for tabla in ("conversaciones", "mensajes", "eventos", "productos", "ajustes"):
+        for tabla in ("conversaciones", "mensajes", "eventos", "productos", "ajustes", "pedidos"):
             datos[tabla] = [dict(r) for r in con.execute(f"SELECT * FROM {tabla}").fetchall()]
         datos["usuarios"] = [dict(r) for r in con.execute(
             "SELECT usuario, nombre, rol, activo, creado FROM usuarios").fetchall()]
