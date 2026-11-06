@@ -1117,6 +1117,33 @@ PALABRAS_PRODUCTOS = ("productos", "catalogo", "que venden", "que vende", "que t
 PALABRAS_MENU = ("menu", "opciones", "ayuda", "inicio", "info", "informacion")
 PALABRAS_SALUDO = ("hola", "buenas", "buen dia", "buenos dias", "buenas tardes", "buenas noches", "hey")
 PALABRAS_GRACIAS = ("gracias", "muchas gracias", "mil gracias")
+# Mensajes de despedida: el bot NO contesta (ni "gracias", ni "igualmente", ni "ok", ni solo emojis).
+CIERRE_FUERTES = {"gracias", "gracia", "ok", "oka", "okey", "okay", "okey", "dale", "listo", "perfecto",
+                  "genial", "excelente", "buenisimo", "barbaro", "joya", "igualmente", "igual", "chau",
+                  "chao", "adios", "saludos", "abrazo", "abrazos", "vale", "entendido", "gracais", "grax",
+                  "gracias", "hablamos", "cuidate", "cuidense", "bueno", "bien", "ya", "tranqui", "tranquilo"}
+CIERRE_RELLENO = {"muchas", "mil", "muchisimas", "muy", "buen", "buena", "buenas", "dia", "dias", "tarde",
+                  "tardes", "noche", "noches", "finde", "semana", "tambien", "igual", "de", "nada", "por",
+                  "todo", "la", "el", "lo", "te", "les", "se", "a", "vos", "ustedes", "hasta", "luego",
+                  "manana", "nos", "vemos", "que", "descanses", "disfrutes", "estes", "esten", "bien",
+                  "pasen", "pases", "lindo", "linda", "ahi", "estamos", "gracias", "y", "e", "un", "gran",
+                  "saludo", "cordial", "cordiales", "atencion", "ayuda", "rapido", "rapida", "respuesta",
+                  "info", "informacion", "entonces", "mas", "ahora", "despues", "paso", "pasamos", "voy",
+                  "veo", "vemos", "avisamos", "aviso", "aviso", "ahi", "voy", "me", "mi"}
+
+
+def es_cierre(texto):
+    """True si el mensaje es solo una despedida/agradecimiento ('Ok, gracias', 'Igualmente', '👍').
+    'Buenas tardes' solo NO es cierre (es un saludo); 'gracias, tienen cemento?' tampoco."""
+    t = normalizar(texto)
+    if not t:  # solo emojis o signos
+        return True
+    palabras = t.split()
+    if len(palabras) > 8:
+        return False
+    if not all(w in CIERRE_FUERTES or w in CIERRE_RELLENO for w in palabras):
+        return False
+    return any(w in CIERRE_FUERTES for w in palabras)
 BOTONES = {"horarios": "horarios", "productos": "productos", "vendedor": "vendedor"}
 PALABRAS_PRESUPUESTO = ("presupuesto", "presupuestos", "cotizacion", "cotizar")
 PALABRAS_PEDIDO = ("mi pedido", "ver pedido", "pedido", "carrito", "mi carrito")
@@ -1285,6 +1312,10 @@ def manejar_espera(numero, texto, espera):
     """El cliente estaba por decirnos una cantidad (o un producto que no está en el catálogo).
     Devuelve True si este mensaje era esa respuesta; False si hay que atenderlo normalmente."""
     t = normalizar(texto)
+    if es_cierre(texto):  # "ok gracias": no es un producto ni una cantidad; se cierra en silencio
+        marcar(numero, espera="", fallos=0)
+        evento("cierre")
+        return True
     if not t or tiene(t, PALABRAS_VENDEDOR):
         marcar(numero, espera="")
         return False
@@ -1326,6 +1357,10 @@ def responder(numero, texto, primer_mensaje):
     c = conv(numero)
     espera = espera_vigente(c)
     if espera and manejar_espera(numero, texto, espera):
+        return
+    if es_cierre(texto):  # despedida / agradecimiento: el bot no contesta
+        marcar(numero, fallos=0)
+        evento("cierre")
         return
     prods = productos_en(t)
     aclarar = []
@@ -1388,8 +1423,6 @@ def responder(numero, texto, primer_mensaje):
     elif tiene(t, PALABRAS_MENU) or tiene(t, PALABRAS_SALUDO):
         evento("saludo")
         decir_menu(numero, saludo_texto())
-    elif tiene(t, PALABRAS_GRACIAS):
-        decir(numero, "¡De nada! 🙌 Cualquier cosa, escribinos.")
     elif primer_mensaje:
         evento("no_entendido", texto)  # lo anotamos, pero primero lo saludamos
         decir_menu(numero, saludo_texto())
@@ -2421,20 +2454,29 @@ function iniciarAudio() {
   if (audioCtx) return;
   try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; }
 }
-function pitido() {
+function nota(freq, inicio, dur, vol) {
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = "sine"; o.frequency.value = freq;
+  const t0 = audioCtx.currentTime + inicio;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function pitido(tipo) {
   if (!sonidoOn || !audioCtx) return;
   try {
-    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-    o.type = "sine"; o.frequency.value = 880; g.gain.value = 0.15;
-    o.connect(g); g.connect(audioCtx.destination);
-    o.start(); o.stop(audioCtx.currentTime + 0.25);
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    if (tipo === "alerta") { nota(988, 0, 0.16, 0.3); nota(1319, 0.14, 0.16, 0.3); nota(1568, 0.28, 0.3, 0.3); }
+    else { nota(1046, 0, 0.1, 0.25); nota(1397, 0.09, 0.22, 0.25); }
   } catch (e) {}
 }
 function pintarBotonSonido() { $("btnSonido").textContent = sonidoOn ? "🔔 Sonido: sí" : "🔕 Sonido: no"; }
 $("btnSonido").addEventListener("click", () => {
   sonidoOn = !sonidoOn;
   try { localStorage.setItem("sonido", sonidoOn ? "1" : "0"); } catch (e) {}
-  if (sonidoOn) { iniciarAudio(); pitido(); }
+  if (sonidoOn) { iniciarAudio(); pitido("mensaje"); }
   pintarBotonSonido();
 });
 document.addEventListener("click", iniciarAudio, { once: true });
@@ -2448,7 +2490,10 @@ async function cargarLista() {
   const pend = datosLista.filter(c => c.pide_vendedor).length;
   const aAtender = datosLista.filter(c => c.humano).reduce((s, c) => s + c.no_leidos, 0);
   document.title = (pend ? "(" + pend + ") 🔔 " : "") + "Panel Ferretería";
-  if (previo && (pend > previo.pend || aAtender > previo.aAtender)) pitido();
+  if (previo) {
+    if (pend > previo.pend) pitido("alerta");
+    else if (aAtender > previo.aAtender) pitido("mensaje");
+  }
   previo = { pend, aAtender };
   $("cuentaPend").textContent = pend ? "(" + pend + ")" : "";
   pintarLista();
@@ -2898,4 +2943,4 @@ def panel():
 
 if __name__ == "__main__":
     # Solo para probar en tu compu. En Render se usa gunicorn.
-    app.run(port=5000, debug=True)
+    app.run(port=5000, debug=True)  
