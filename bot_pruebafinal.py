@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 7: fotos en la lista de productos + pedido/carrito + presupuesto)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 9: varias fotos por producto, borrar productos, emojis, calificación, doble tilde)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -88,19 +88,7 @@ TEXTO_ENVIO = (
 
 # Productos con info y foto. La foto va en la carpeta "catalogo/" (jpg o png).
 # Sin precios a propósito: los precios los pasa siempre una persona.
-PRODUCTOS = {
-    "arcilla": {
-        "nombre": "Arcilla",
-        "palabras": ("arcilla", "arcillas"),
-        "foto": "arcilla.jpg",
-        "texto": (
-            "🧱 *Arcilla refractaria / común* 🛠️\n\n"
-            "Tenemos excelente calidad para tus obras y construcciones. "
-            "Viene en presentación lista para usar.\n\n"
-            "Para consultar cantidades o precio, escribí *VENDEDOR*."
-        ),
-    },
-}
+PRODUCTOS = {}  # los productos se cargan desde el panel (📦 Catálogo) o poniendo fotos en catalogo/
 
 # Frases que los vendedores pueden insertar con un toque en el panel.
 RESPUESTAS_RAPIDAS = [
@@ -395,6 +383,8 @@ def iniciar_db():
                 con.execute(sentencia)
         if USA_PG:
             con.execute(SCHEMA_ARCHIVOS_PG)
+        _agregar_columna(con, "productos", "fotos", "TEXT NOT NULL DEFAULT ''")   # fotos extra, separadas por coma
+        _agregar_columna(con, "productos", "oculto", "INTEGER NOT NULL DEFAULT 0")  # 1 = producto quitado del catálogo
         _agregar_columna(con, "mensajes", "autor", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "atiende", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "espera", "TEXT NOT NULL DEFAULT ''")
@@ -498,6 +488,7 @@ def _defaults():
         "feriados": list(FERIADOS),
         "fuera_horario": AVISO_FUERA_DE_HORARIO,
         "rapidas": list(RESPUESTAS_RAPIDAS),
+        "link_resena": "",
     }
 
 
@@ -519,6 +510,14 @@ def ajustes(forzar=False):
             log.exception("No pude leer los ajustes: uso los valores del código")
         _aj_cache[0], _aj_cache[1] = time.time(), datos
     return _aj_cache[1]
+
+
+def texto_resena():
+    """Mensaje rápido para pedir la calificación (el link se carga en ⚙️ Ajustes)."""
+    a = ajustes()
+    t = f"¡Gracias por tu compra en {a['nombre']}! 🙌 Si quedaste conforme, ¿nos dejás tu calificación? ⭐⭐⭐⭐⭐ Nos ayuda muchísimo."
+    link = (a.get("link_resena") or "").strip()
+    return t + (f"\n{link}" if link else "")
 
 
 def saludo_texto():
@@ -554,6 +553,7 @@ def validar_ajustes(d):
         "envios": (900, "El texto de envíos", False),
         "cerrado": (60, "Los días cerrados", False),
         "fuera_horario": (300, "El aviso fuera de horario", False),
+        "link_resena": (300, "El link de calificación", False),
     }
     for clave, (maximo, etiqueta, obligatorio) in campos.items():
         if clave not in d:
@@ -647,6 +647,7 @@ def texto_horarios(con_pregunta=False):
 
 # ---- CATÁLOGO: productos del código + fotos de la carpeta catalogo/ + productos cargados en el panel
 EXT_FOTO = (".jpg", ".jpeg", ".png")
+MAX_FOTOS_PRODUCTO = 6  # fotos por producto (la principal + 5)
 PALABRAS_VACIAS = {"de", "del", "la", "el", "los", "las", "para", "con", "y", "en", "un", "una"}
 _cat_cache = [0.0, []]
 
@@ -675,7 +676,8 @@ def _titulo(nombre):
     return nombre[:1].upper() + nombre[1:]
 
 
-def _catalogo_armar():
+def _catalogo_base():
+    """Productos que vienen de la carpeta catalogo/ y de PRODUCTOS (no editables desde el panel)."""
     cat = {}
     # 1) fotos sueltas en la carpeta catalogo/
     try:
@@ -708,15 +710,24 @@ def _catalogo_armar():
         cat[clave] = {"clave": clave, "nombre": p["nombre"], "terms": [p["nombre"], *p.get("palabras", ())],
                       "texto": p.get("texto", ""), "origen": "c", "foto": foto, "editable": False,
                       "fuente": "código"}
-    # 3) productos cargados desde el panel (los más nuevos mandan)
+    return cat
+
+
+def _catalogo_armar():
+    cat = _catalogo_base()
+    # 3) productos cargados desde el panel (los más nuevos mandan). oculto=1: el vendedor lo quitó.
     try:
         with tx() as con:
-            filas = [dict(r) for r in con.execute("SELECT clave, nombre, palabras, texto, foto FROM productos").fetchall()]
+            filas = [dict(r) for r in con.execute(
+                "SELECT clave, nombre, palabras, texto, foto, fotos, oculto FROM productos").fetchall()]
         for r in filas:
+            if r["oculto"]:
+                cat.pop(r["clave"], None)
+                continue
             extras = [x.strip() for x in (r["palabras"] or "").split(",") if x.strip()]
             cat[r["clave"]] = {"clave": r["clave"], "nombre": r["nombre"], "terms": [r["nombre"], *extras],
                                "texto": r["texto"], "origen": "m", "foto": r["foto"], "editable": True,
-                               "fuente": "panel"}
+                               "fuente": "panel", "extras": [x for x in (r["fotos"] or "").split(",") if x]}
     except Exception:
         log.exception("No pude leer los productos del panel")
     return sorted(cat.values(), key=lambda p: p["nombre"].lower())
@@ -1071,8 +1082,24 @@ def botones_producto(p):
     return [("add:" + p["clave"], "➕ Agregar al pedido"), ("productos", "🧱 Ver productos"), ("vendedor", "👤 Vendedor")]
 
 
+def enviar_fotos_extra(numero, p):
+    """Las otras fotos del producto (si el vendedor cargó más de una), una detrás de otra."""
+    for f in (p.get("extras") or [])[:MAX_FOTOS_PRODUCTO - 1]:
+        ok, wamid, error = enviar_foto(numero, "m", f, "")
+        if ok:
+            registrar(numero, "bot", "image", "", archivo=f"m/{f}", wamid=wamid, estado="sent")
+        else:
+            log.warning("No pude mandar la foto extra %s (%s)", f, error)
+
+
 def enviar_producto(numero, p):
-    """Foto + descripción + botón para sumarlo al pedido."""
+    """Foto + descripción + botón para sumarlo al pedido (y las demás fotos del producto)."""
+    enviar_producto_base(numero, p)
+    if p.get("foto") and p.get("extras"):
+        enviar_fotos_extra(numero, p)
+
+
+def enviar_producto_base(numero, p):
     texto = p["texto"] or (
         f"🧰 *{p['nombre']}*\n\nPara consultar stock, medidas o precio, escribí *VENDEDOR*."
     )
@@ -1813,7 +1840,7 @@ MSG_VENTANA = (
 def api_config():
     a = ajustes()
     return jsonify({
-        "rapidas": a["rapidas"], "negocio": a["nombre"], "db": "supabase" if USA_PG else "temporal",
+        "rapidas": a["rapidas"], "negocio": a["nombre"], "resena": texto_resena(), "db": "supabase" if USA_PG else "temporal",
         "usuario": session.get("usuario", "admin"), "nombre": quien(), "rol": session.get("rol", "admin"),
     })
 
@@ -2027,11 +2054,16 @@ def api_reporte():
 @app.route("/api/catalogo")
 @requiere_login
 def api_catalogo():
-    return jsonify([{
-        "clave": p["clave"], "nombre": p["nombre"], "texto": p["texto"],
-        "palabras": ", ".join(p["terms"][1:]), "editable": p["editable"], "fuente": p["fuente"],
-        "foto": url_media(f"{p['origen']}/{p['foto']}") if p["foto"] else "",
-    } for p in catalogo_actual(True)])
+    salida = []
+    for p in catalogo_actual(True):
+        nombres = ([p["foto"]] if p["foto"] else []) + list(p.get("extras") or [])
+        salida.append({
+            "clave": p["clave"], "nombre": p["nombre"], "texto": p["texto"],
+            "palabras": ", ".join(p["terms"][1:]), "editable": p["editable"], "fuente": p["fuente"],
+            "foto": url_media(f"{p['origen']}/{p['foto']}") if p["foto"] else "",
+            "fotos": [{"nombre": f, "url": url_media(f"{p['origen']}/{f}")} for f in nombres],
+        })
+    return jsonify(salida)
 
 
 @app.route("/api/catalogo", methods=["POST"])
@@ -2043,28 +2075,43 @@ def api_catalogo_guardar():
     clave = normalizar(nombre)
     if not clave:
         return jsonify({"ok": False, "error": "Poné el nombre del producto."}), 400
-    foto = ""
-    archivo = request.files.get("foto")
-    datos = archivo.read() if archivo else b""
-    if datos:
+    try:
+        quitar = {str(x) for x in json.loads(request.form.get("quitar") or "[]")}
+    except ValueError:
+        quitar = set()
+    nuevas = []
+    subidas = request.files.getlist("fotos") + request.files.getlist("foto")
+    for archivo in subidas:
+        datos = archivo.read()
+        if not datos:
+            continue
         tipo, ext, mime = detectar_tipo(datos)
         if tipo != "image":
-            return jsonify({"ok": False, "error": "La foto tiene que ser JPG o PNG."}), 400
+            return jsonify({"ok": False, "error": "Las fotos tienen que ser JPG o PNG."}), 400
         if len(datos) > MAX_FOTO:
-            return jsonify({"ok": False, "error": "La foto pesa demasiado (máximo 5 MB)."}), 400
-        foto = uuid.uuid4().hex + ext
-        guardar_archivo(foto, datos, mime)
+            return jsonify({"ok": False, "error": "Una foto pesa demasiado (máximo 5 MB)."}), 400
+        nuevas.append((uuid.uuid4().hex + ext, datos, mime))
     with tx() as con:
-        previo = con.execute("SELECT foto FROM productos WHERE clave=?", (clave,)).fetchone()
-        foto_vieja = previo["foto"] if previo else ""
+        previo = con.execute("SELECT foto, fotos FROM productos WHERE clave=?", (clave,)).fetchone()
+        viejas = ([previo["foto"]] if previo and previo["foto"] else []) + \
+                 ([x for x in (previo["fotos"] or "").split(",") if x] if previo else [])
+        quedan = [f for f in viejas if f not in quitar]
+        if len(quedan) + len(nuevas) > MAX_FOTOS_PRODUCTO:
+            return jsonify({"ok": False, "error": f"Máximo {MAX_FOTOS_PRODUCTO} fotos por producto."}), 400
+        for nom, datos, mime in nuevas:
+            guardar_archivo(nom, datos, mime)
+        todas = quedan + [n[0] for n in nuevas]
+        principal, extras = (todas[0] if todas else ""), ",".join(todas[1:])
+        ahora_ts = time.time()
         con.execute(
-            "INSERT INTO productos (clave, nombre, palabras, texto, foto, ts) VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT (clave) DO UPDATE SET nombre=?, palabras=?, texto=?, foto=?, ts=?",
-            (clave, nombre, palabras, texto, foto or foto_vieja, time.time(),
-             nombre, palabras, texto, foto or foto_vieja, time.time()),
+            "INSERT INTO productos (clave, nombre, palabras, texto, foto, fotos, oculto, ts) VALUES (?,?,?,?,?,?,0,?) "
+            "ON CONFLICT (clave) DO UPDATE SET nombre=?, palabras=?, texto=?, foto=?, fotos=?, oculto=0, ts=?",
+            (clave, nombre, palabras, texto, principal, extras, ahora_ts,
+             nombre, palabras, texto, principal, extras, ahora_ts),
         )
-    if foto and foto_vieja:
-        borrar_archivo(foto_vieja)
+    for f in viejas:
+        if f in quitar:
+            borrar_archivo(f)
     catalogo_actual(True)  # el bot lo reconoce desde este mismo instante
     return jsonify({"ok": True})
 
@@ -2072,15 +2119,24 @@ def api_catalogo_guardar():
 @app.route("/api/catalogo/borrar", methods=["POST"])
 @requiere_login
 def api_catalogo_borrar():
+    """Quita un producto. Si venía de GitHub (carpeta/código) se oculta; si era del panel se borra con sus fotos."""
     clave = str((request.get_json(silent=True) or {}).get("clave", ""))
+    base = _catalogo_base().get(clave)
     with tx() as con:
-        fila = con.execute("SELECT foto FROM productos WHERE clave=?", (clave,)).fetchone()
-        if fila is None:
-            return jsonify({"ok": False, "error": "Ese producto viene de la carpeta catalogo/ de GitHub: "
-                            "para quitarlo, borrá la foto de ahí."}), 400
-        con.execute("DELETE FROM productos WHERE clave=?", (clave,))
-    if fila["foto"]:
-        borrar_archivo(fila["foto"])
+        fila = con.execute("SELECT nombre, foto, fotos FROM productos WHERE clave=?", (clave,)).fetchone()
+        if fila is None and base is None:
+            return jsonify({"ok": False, "error": "No encontré ese producto."}), 404
+        if base is not None:
+            con.execute(
+                "INSERT INTO productos (clave, nombre, palabras, texto, foto, fotos, oculto, ts) VALUES (?,?,?,?,?,?,1,?) "
+                "ON CONFLICT (clave) DO UPDATE SET foto='', fotos='', oculto=1, ts=?",
+                (clave, base["nombre"], "", "", "", "", time.time(), time.time()),
+            )
+        else:
+            con.execute("DELETE FROM productos WHERE clave=?", (clave,))
+    if fila:
+        for f in ([fila["foto"]] if fila["foto"] else []) + [x for x in (fila["fotos"] or "").split(",") if x]:
+            borrar_archivo(f)
     catalogo_actual(True)
     return jsonify({"ok": True})
 
@@ -2290,7 +2346,17 @@ button:disabled{opacity:.5;cursor:default}
 .bot{background:#d9edff;align-self:flex-end}
 .vendedor{background:#dcf8c6;align-self:flex-end}
 .pie{display:block;font-size:11px;color:var(--gris);margin-top:3px;text-align:right}
+.tick{font-weight:700;letter-spacing:-3px;margin-left:2px;color:#8696a0}
 .tick.leido{color:#34b7f1}
+.emojibtn{background:none;border:0;font-size:22px;padding:0 6px;cursor:pointer}
+#emojis{display:flex;flex-wrap:wrap;gap:2px;padding:6px 10px;background:#fff;border-top:1px solid #e3e3e3;max-height:130px;overflow-y:auto}
+#emojis button{background:none;border:0;font-size:22px;padding:2px 4px;cursor:pointer;border-radius:6px}
+#emojis button:hover{background:#eee}
+#catFotos{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
+.fotoed{position:relative}
+.fotoed img{width:64px;height:64px;object-fit:cover;border-radius:6px;display:block}
+.fotoed button{position:absolute;top:-6px;right:-6px;width:20px;height:20px;border-radius:50%;padding:0;line-height:18px;font-size:12px;background:#b00020;color:#fff;border:0}
+.fotoed .princ{position:absolute;bottom:0;left:0;right:0;background:#0008;color:#fff;font-size:10px;text-align:center;border-radius:0 0 6px 6px}
 .falla{margin-top:4px;font-size:12px;color:#b00020}
 img.foto{max-width:240px;max-height:260px;border-radius:8px;cursor:pointer;display:block;margin-bottom:4px}
 video.video{max-width:260px;border-radius:8px;display:block;margin-bottom:4px}
@@ -2359,9 +2425,11 @@ button.mini{padding:4px 10px;font-size:13px}
    </div>
    <div id="avisoVentana" class="oculto">⏳ Pasaron más de 24 hs desde el último mensaje del cliente: WhatsApp no deja escribirle primero. Esperá a que él escriba.</div>
    <div id="msgs"></div>
+   <div id="emojis" class="oculto"></div>
    <div id="rapidas"></div>
    <div id="form">
     <label class="adjuntar" title="Adjuntar foto o PDF">📎<input type="file" id="inputArchivo" accept="image/*,.pdf,application/pdf" class="oculto"></label>
+    <button type="button" class="emojibtn" id="btnEmoji" title="Emojis">😀</button>
     <textarea id="texto" placeholder="Escribí tu respuesta..."></textarea>
     <button id="enviar">Enviar</button>
    </div>
@@ -2378,7 +2446,9 @@ button.mini{padding:4px 10px;font-size:13px}
   <input type="text" id="catNombre" placeholder="Nombre (ej: Cemento portland)" maxlength="60">
   <input type="text" id="catPalabras" placeholder="También se busca como, separado por comas (ej: cemento, portland)" maxlength="200">
   <textarea id="catTexto" placeholder="Descripción que ve el cliente (opcional)" maxlength="900"></textarea>
-  <input type="file" id="catFoto" accept="image/png,image/jpeg">
+  <div class="suave">Fotos del producto (hasta 6; la primera es la principal)</div>
+  <div id="catFotos"></div>
+  <input type="file" id="catFoto" accept="image/png,image/jpeg" multiple>
   <button id="catGuardar">Guardar producto</button>
  </div>
  <p><button class="sec" id="cerrarCat">Cerrar</button></p>
@@ -2399,6 +2469,7 @@ button.mini{padding:4px 10px;font-size:13px}
  <h3>Mensajes</h3>
  <div class="campo"><label for="ajSaludo">Saludo del bot (escribí {nombre} donde va el nombre del local)</label><textarea id="ajSaludo" maxlength="900"></textarea></div>
  <div class="campo"><label for="ajFuera">Aviso cuando está fuera de horario</label><textarea id="ajFuera" maxlength="300"></textarea></div>
+ <div class="campo"><label for="ajResena">Link para que te califiquen (Google Maps u otro). Lo usa el botón ⭐ Pedir calificación del chat</label><input type="text" id="ajResena" maxlength="300" placeholder="https://g.page/r/..."></div>
  <div class="campo"><label for="ajRapidas">Respuestas rápidas de los vendedores (una por línea)</label><textarea id="ajRapidas"></textarea></div>
  <p><button id="ajGuardar">Guardar ajustes</button></p>
  <h3>Equipo: un usuario por vendedor</h3>
@@ -2694,6 +2765,17 @@ $("inputArchivo").addEventListener("change", enviarArchivo);
 $("guardarNombre").addEventListener("click", guardarNombre);
 $("inputNombre").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); guardarNombre(); } });
 $("devolver").addEventListener("click", devolver);
+const EMOJIS = "😀 😃 😄 😁 😊 🙂 😉 😍 🤗 😎 🤝 🙌 👍 👌 👏 🙏 💪 ✅ ❌ ⚠️ ⭐ 🔥 ❤️ 💙 🎉 😅 😂 🤔 😢 🙁 😮 👋 👉 👇 📍 🕒 📞 📦 🧱 🛠️ 🔧 🔨 🪛 🪚 🧰 🔩 🚚 💳 💵 🏠".split(" ");
+EMOJIS.forEach(e => {
+  const b = el("button", "", e); b.type = "button";
+  b.addEventListener("click", () => {
+    const ta = $("texto"), a = ta.selectionStart ?? ta.value.length, z = ta.selectionEnd ?? a;
+    ta.value = ta.value.slice(0, a) + e + ta.value.slice(z);
+    ta.focus(); ta.selectionStart = ta.selectionEnd = a + e.length;
+  });
+  $("emojis").appendChild(b);
+});
+$("btnEmoji").addEventListener("click", () => $("emojis").classList.toggle("oculto"));
 $("texto").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } });
 $("atras").addEventListener("click", () => {
   actual = null;
@@ -2737,9 +2819,25 @@ $("modal").addEventListener("click", e => { if (e.target === $("modal")) $("moda
 document.addEventListener("keydown", e => { if (e.key === "Escape") { $("modal").classList.add("oculto"); $("modalCat").classList.add("oculto"); $("modalAj").classList.add("oculto"); } });
 
 /* ---------- catálogo ---------- */
+let fotosEd = [], quitarEd = new Set();
+function pintarFotosEd() {
+  const caja = $("catFotos");
+  vaciar(caja);
+  fotosEd.forEach((f, i) => {
+    if (quitarEd.has(f.nombre)) return;
+    const d = el("div", "fotoed");
+    const im = el("img"); im.src = f.url; im.alt = "";
+    const x = el("button", "", "✕"); x.type = "button"; x.title = "Quitar esta foto";
+    x.addEventListener("click", () => { quitarEd.add(f.nombre); pintarFotosEd(); });
+    d.appendChild(im); d.appendChild(x);
+    if (i === 0) d.appendChild(el("div", "princ", "principal"));
+    caja.appendChild(d);
+  });
+}
 function limpiarFormCat() {
   $("catNombre").value = ""; $("catPalabras").value = ""; $("catTexto").value = ""; $("catFoto").value = "";
   $("catTitulo").textContent = "Agregar producto";
+  fotosEd = []; quitarEd = new Set(); pintarFotosEd();
 }
 async function cargarCatalogo() {
   const caja = $("catLista");
@@ -2759,18 +2857,20 @@ async function cargarCatalogo() {
       const ed = el("button", "sec mini", "Editar");
       ed.addEventListener("click", () => {
         $("catNombre").value = p.nombre; $("catPalabras").value = p.palabras; $("catTexto").value = p.texto;
-        $("catTitulo").textContent = "Editando: " + p.nombre + " (la foto es opcional)";
+        $("catTitulo").textContent = "Editando: " + p.nombre + " (podés sumar o quitar fotos)";
+        fotosEd = p.fotos || []; quitarEd = new Set(); pintarFotosEd();
         $("catNombre").focus();
       });
-      const bo = el("button", "sec mini", "Borrar");
-      bo.addEventListener("click", async () => {
-        if (!confirm("¿Borrar " + p.nombre + " del catálogo?")) return;
-        const rr = await api("/api/catalogo/borrar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clave: p.clave }) });
-        if (!(rr.ok && rr.data && rr.data.ok)) toast((rr.data && rr.data.error) || "No se pudo borrar", true);
-        cargarCatalogo().catch(() => {});
-      });
-      fila.appendChild(ed); fila.appendChild(bo);
+      fila.appendChild(ed);
     }
+    const bo = el("button", "sec mini", "Borrar");
+    bo.addEventListener("click", async () => {
+      if (!confirm("¿Borrar " + p.nombre + " del catálogo?")) return;
+      const rr = await api("/api/catalogo/borrar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clave: p.clave }) });
+      if (!(rr.ok && rr.data && rr.data.ok)) toast((rr.data && rr.data.error) || "No se pudo borrar", true);
+      cargarCatalogo().catch(() => {});
+    });
+    fila.appendChild(bo);
     caja.appendChild(fila);
   });
 }
@@ -2783,8 +2883,9 @@ async function guardarProducto() {
     fd.append("nombre", nombre);
     fd.append("palabras", $("catPalabras").value.trim());
     fd.append("texto", $("catTexto").value.trim());
-    const f = $("catFoto").files[0];
-    if (f) fd.append("foto", await reducirImagen(f), "foto.jpg");
+    const archivos = Array.from($("catFoto").files);
+    for (const f of archivos) fd.append("fotos", await reducirImagen(f), "foto.jpg");
+    fd.append("quitar", JSON.stringify(Array.from(quitarEd)));
     const r = await api("/api/catalogo", { method: "POST", body: fd });
     if (r.ok && r.data && r.data.ok) { toast("Listo: el bot ya reconoce \"" + nombre + "\""); limpiarFormCat(); await cargarCatalogo(); }
     else toast("No se pudo guardar: " + ((r.data && r.data.error) || "error desconocido"), true);
@@ -2835,7 +2936,7 @@ async function cargarAjustes() {
   const a = r.data;
   $("ajNombre").value = a.nombre || ""; $("ajDireccion").value = a.direccion || ""; $("ajPago").value = a.medios_pago || "";
   $("ajEnvios").value = a.envios || ""; $("ajCerrado").value = a.cerrado || ""; $("ajSaludo").value = a.saludo || "";
-  $("ajFuera").value = a.fuera_horario || ""; $("ajRapidas").value = (a.rapidas || []).join("\n");
+  $("ajFuera").value = a.fuera_horario || ""; $("ajResena").value = a.link_resena || ""; $("ajRapidas").value = (a.rapidas || []).join("\n");
   $("ajFeriados").value = (a.feriados || []).map(fechaLinda).join("\n");
   turnosEd = (a.turnos || []).map(t => ({ nombre: t.nombre, dias: t.dias.slice(), desde: t.desde, hasta: t.hasta }));
   pintarTurnos();
@@ -2848,7 +2949,7 @@ async function guardarAjustes() {
       body: JSON.stringify({
         nombre: $("ajNombre").value, direccion: $("ajDireccion").value, medios_pago: $("ajPago").value,
         envios: $("ajEnvios").value, cerrado: $("ajCerrado").value, saludo: $("ajSaludo").value,
-        fuera_horario: $("ajFuera").value, rapidas: $("ajRapidas").value, feriados: $("ajFeriados").value,
+        fuera_horario: $("ajFuera").value, link_resena: $("ajResena").value, rapidas: $("ajRapidas").value, feriados: $("ajFeriados").value,
         turnos: turnosEd
       })
     });
@@ -2908,8 +3009,9 @@ api("/api/config").then(r => {
   if (r.data.rol === "admin") $("btnAjustes").classList.remove("oculto");
   $("modoDb").textContent = r.data.db === "supabase" ? "🟢 Datos guardados en Supabase" : "⚠️ Base temporal: se borra al reiniciar";
   const caja = $("rapidas");
-  (r.data.rapidas || []).forEach(t => {
-    const b = el("button", "chip", t.length > 30 ? t.slice(0, 30) + "…" : t);
+  const frases = [r.data.resena, ...(r.data.rapidas || [])].filter(Boolean);
+  frases.forEach((t, i) => {
+    const b = el("button", "chip", i === 0 && r.data.resena ? "⭐ Pedir calificación" : (t.length > 30 ? t.slice(0, 30) + "…" : t));
     b.title = t;
     b.addEventListener("click", () => {
       const ta = $("texto");
@@ -2943,4 +3045,4 @@ def panel():
 
 if __name__ == "__main__":
     # Solo para probar en tu compu. En Render se usa gunicorn.
-    app.run(port=5000, debug=True)  
+    app.run(port=5000, debug=True)
