@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 9: varias fotos por producto, borrar productos, emojis, calificación, doble tilde)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 10: buscador y categorías en el catálogo, pausar productos, Excel del pedido)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -385,6 +385,8 @@ def iniciar_db():
             con.execute(SCHEMA_ARCHIVOS_PG)
         _agregar_columna(con, "productos", "fotos", "TEXT NOT NULL DEFAULT ''")   # fotos extra, separadas por coma
         _agregar_columna(con, "productos", "oculto", "INTEGER NOT NULL DEFAULT 0")  # 1 = producto quitado del catálogo
+        _agregar_columna(con, "productos", "categoria", "TEXT NOT NULL DEFAULT ''")
+        _agregar_columna(con, "productos", "activo", "INTEGER NOT NULL DEFAULT 1")  # 0 = pausado (no lo tenemos)
         _agregar_columna(con, "mensajes", "autor", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "atiende", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "espera", "TEXT NOT NULL DEFAULT ''")
@@ -714,37 +716,82 @@ def _catalogo_base():
 
 
 def _catalogo_armar():
+    """Todos los productos (activos y pausados). El bot usa catalogo_actual(), que solo trae los activos."""
     cat = _catalogo_base()
+    for p in cat.values():
+        p.setdefault("categoria", "")
+        p.setdefault("activo", True)
     # 3) productos cargados desde el panel (los más nuevos mandan). oculto=1: el vendedor lo quitó.
+    #    Si el producto también viene de GitHub, lo del panel (categoría, pausa, texto) se suma a lo de GitHub.
     try:
         with tx() as con:
             filas = [dict(r) for r in con.execute(
-                "SELECT clave, nombre, palabras, texto, foto, fotos, oculto FROM productos").fetchall()]
+                "SELECT clave, nombre, palabras, texto, foto, fotos, oculto, categoria, activo FROM productos").fetchall()]
         for r in filas:
             if r["oculto"]:
                 cat.pop(r["clave"], None)
                 continue
+            base = cat.get(r["clave"])
             extras = [x.strip() for x in (r["palabras"] or "").split(",") if x.strip()]
-            cat[r["clave"]] = {"clave": r["clave"], "nombre": r["nombre"], "terms": [r["nombre"], *extras],
-                               "texto": r["texto"], "origen": "m", "foto": r["foto"], "editable": True,
-                               "fuente": "panel", "extras": [x for x in (r["fotos"] or "").split(",") if x]}
+            terms = [r["nombre"], *extras]
+            if base:
+                terms += [t for t in base["terms"] if normalizar(t) not in {normalizar(x) for x in terms}]
+            propia = bool(r["foto"])
+            cat[r["clave"]] = {
+                "clave": r["clave"], "nombre": r["nombre"], "terms": terms,
+                "texto": r["texto"] or (base["texto"] if base else ""),
+                "origen": "m" if (propia or not base) else base["origen"],
+                "foto": r["foto"] if (propia or not base) else base["foto"],
+                "editable": True, "fuente": "panel" if not base else base["fuente"] + " + panel",
+                "extras": [x for x in (r["fotos"] or "").split(",") if x],
+                "categoria": (r["categoria"] or "").strip(), "activo": bool(r["activo"]),
+                "foto_propia": propia,
+            }
     except Exception:
         log.exception("No pude leer los productos del panel")
     return sorted(cat.values(), key=lambda p: p["nombre"].lower())
 
 
-def catalogo_actual(forzar=False):
+def catalogo_todo(forzar=False):
+    """Todos los productos, también los pausados (lo usa el panel)."""
     if forzar or time.time() - _cat_cache[0] > 5:
         _cat_cache[1] = _catalogo_armar()
         _cat_cache[0] = time.time()
     return _cat_cache[1]
 
 
-def productos_en(t):
-    """Productos del catálogo nombrados en el mensaje (ya normalizado)."""
+def catalogo_actual(forzar=False):
+    """Solo los productos activos: lo que el bot ofrece a los clientes."""
+    return [p for p in catalogo_todo(forzar) if p["activo"]]
+
+
+def categorias_activas():
+    """[(clave, título)] de las categorías con productos activos; los sin categoría van a 'Otros productos'."""
+    vistas, hay_otros = {}, False
+    for p in catalogo_actual():
+        c = p.get("categoria") or ""
+        if c:
+            vistas.setdefault(normalizar(c), c)
+        else:
+            hay_otros = True
+    lista = sorted(vistas.items(), key=lambda kv: kv[1].lower())
+    if hay_otros and lista:
+        lista.append(("_otros", "Otros productos"))
+    return lista
+
+
+def productos_de_categoria(clave):
+    return [p for p in catalogo_actual()
+            if (normalizar(p.get("categoria") or "") or "_otros") == clave]
+
+
+def productos_en(t, pausados=False):
+    """Productos del catálogo nombrados en el mensaje (ya normalizado). pausados=True busca solo entre los pausados."""
     f = formas(t)
     hallados = []
-    for p in catalogo_actual():
+    for p in (catalogo_todo() if pausados else catalogo_actual()):
+        if pausados and p["activo"]:
+            continue
         mejor = None
         for term in p["terms"]:
             ws = palabras_clave(term)
@@ -771,7 +818,13 @@ def texto_productos():
     cat = catalogo_actual()
     if not cat:
         return "Para consultar por productos escribí *VENDEDOR*."
-    lista = "\n".join(f"• {p['nombre']}" for p in cat[:30])
+    if len(categorias_activas()) >= 2:
+        partes = []
+        for clave, titulo_c in categorias_activas():
+            partes.append(f"*{titulo_c}*\n" + "\n".join(f"• {p['nombre']}" for p in productos_de_categoria(clave)[:15]))
+        lista = "\n\n".join(partes)
+    else:
+        lista = "\n".join(f"• {p['nombre']}" for p in cat[:30])
     return (
         "🧰 Estos son los productos con info y foto:\n"
         f"{lista}\n\n"
@@ -1233,13 +1286,33 @@ def espera_vigente(c):
         return ""
 
 
-def mostrar_productos(numero, pagina=0):
-    """Lista desplegable: el cliente toca un producto y recibe su foto y detalle."""
-    cat = catalogo_actual()
+def mostrar_categorias(numero):
+    """Primer menú de 'Ver productos' cuando hay 2 o más categorías: el cliente elige el rubro."""
+    cats = categorias_activas()[:9]
+    filas = [{"id": "cat:" + c, "title": t[:24]} for c, t in cats]
+    filas.append({"id": "otro", "title": "✍️ Otro producto"})
+    ok, wamid, error = enviar_lista(numero, "🧰 ¿Qué estás buscando? Elegí una categoría 👇", "Ver categorías", filas)
+    if ok:
+        registrar(numero, "bot", "text", "🧰 Lista de categorías: " + " · ".join(t for _, t in cats),
+                  wamid=wamid, estado="sent")
+        return True
+    log.warning("La lista de categorías no funcionó (%s): mando los nombres escritos", error)
+    return decir(numero, texto_productos())
+
+
+def mostrar_productos(numero, pagina=0, categoria=""):
+    """Lista desplegable: el cliente toca un producto y recibe su foto y detalle.
+    Si hay varias categorías, primero elige la categoría (categoria='' = menú de categorías)."""
+    if not categoria and len(categorias_activas()) >= 2:
+        return mostrar_categorias(numero)
+    cat = productos_de_categoria(categoria) if categoria else catalogo_actual()
     if not cat:
         return decir(numero, "Para consultar por productos escribí *VENDEDOR*.")
-    por_pagina = 7
-    if len(cat) <= 9:
+    con_cats = bool(categoria)
+    sufijo = ":" + categoria if categoria else ""
+    tope = 9 - (1 if con_cats else 0)          # filas libres para productos (el resto: otro, categorías)
+    por_pagina = tope - 2                       # si hay que paginar: dejamos lugar para anterior/siguiente
+    if len(cat) <= tope:
         visibles, pagina, hay_mas = cat, 0, False
     else:
         ultima = (len(cat) - 1) // por_pagina
@@ -1248,11 +1321,16 @@ def mostrar_productos(numero, pagina=0):
         hay_mas = pagina < ultima
     filas = [{"id": "prod:" + p["clave"], "title": p["nombre"]} for p in visibles]
     if pagina > 0:
-        filas.append({"id": f"pag:{pagina - 1}", "title": "⬅️ Anteriores"})
+        filas.append({"id": f"pag:{pagina - 1}{sufijo}", "title": "⬅️ Anteriores"})
     if hay_mas:
-        filas.append({"id": f"pag:{pagina + 1}", "title": "➡️ Ver más"})
+        filas.append({"id": f"pag:{pagina + 1}{sufijo}", "title": "➡️ Ver más"})
+    if con_cats:
+        filas.append({"id": "cats", "title": "↩️ Categorías"})
     filas.append({"id": "otro", "title": "✍️ Otro producto"})
-    ok, wamid, error = enviar_lista(numero, "🧰 Elegí un producto para ver su foto y detalles 👇", "Ver productos", filas)
+    titulo_c = dict(categorias_activas()).get(categoria, "")
+    intro = f"🧰 *{titulo_c}*: elegí un producto para ver su foto y detalles 👇" if titulo_c else \
+        "🧰 Elegí un producto para ver su foto y detalles 👇"
+    ok, wamid, error = enviar_lista(numero, intro, "Ver productos", filas)
     if ok:
         registrar(numero, "bot", "text", f"🧰 Lista de productos ({len(cat)})\n🔘 Toca un producto para ver su foto",
                   wamid=wamid, estado="sent")
@@ -1314,9 +1392,14 @@ def manejar_accion(numero, bid):
         poner_espera(numero, "cant:" + p["clave"])
         decir(numero, f"¿Cuánto querés de *{p['nombre']}*? Escribí la cantidad (ej: 2 bolsas, 10 unidades).\n"
                       "Para cancelar escribí *CANCELAR*.")
+    elif bid.startswith("cat:"):
+        mostrar_productos(numero, 0, bid[4:])
+    elif bid == "cats":
+        mostrar_categorias(numero)
     elif bid.startswith("pag:"):
+        num, _, cat_clave = bid[4:].partition(":")
         try:
-            mostrar_productos(numero, int(bid[4:]))
+            mostrar_productos(numero, int(num), cat_clave)
         except ValueError:
             mostrar_productos(numero)
     elif bid == "otro":
@@ -1436,6 +1519,13 @@ def responder(numero, texto, primer_mensaje):
         contesto = True
     for p in prods[:3]:
         enviar_producto(numero, p)
+        contesto = True
+    for p in (productos_en(t, pausados=True) if not prods else [])[:2]:
+        evento("producto_pausado", p["clave"])
+        decir_botones(numero, f"😕 Por el momento no tenemos *{p['nombre']}* disponible. "
+                              "Si querés, un vendedor te recomienda una alternativa o te avisa cuando vuelva a haber.",
+                      [("vendedor", "👤 Hablar con vendedor"), ("productos", "🧱 Ver productos")],
+                      "Escribí *VENDEDOR* para consultar por una alternativa.")
         contesto = True
     if aclarar:
         lista = "\n".join(f"• {p['nombre']}" for p in aclarar)
@@ -1564,7 +1654,7 @@ def procesar_mensaje(msg, perfil=""):
             bid = resp.get("id", "")
             if bid in BOTONES:
                 entrada = BOTONES[bid]
-            elif bid.split(":")[0] in ("prod", "add", "pag") or bid in ("otro", "carrito", "vaciar", "pedir"):
+            elif bid.split(":")[0] in ("prod", "add", "pag", "cat") or bid in ("otro", "carrito", "vaciar", "pedir", "cats"):
                 accion = bid
                 entrada = texto
             else:
@@ -1875,6 +1965,7 @@ def api_conversacion(numero):
         c = con.execute("SELECT * FROM conversaciones WHERE numero=?", (numero,)).fetchone()
         if c is None:
             return jsonify({"error": "no existe"}), 404
+        n_pedidos = con.execute("SELECT COUNT(*) AS n FROM pedidos WHERE numero=?", (numero,)).fetchone()["n"]
         con.execute("UPDATE conversaciones SET no_leidos=0 WHERE numero=?", (numero,))
         filas = con.execute(
             "SELECT * FROM (SELECT * FROM mensajes WHERE numero=? ORDER BY id DESC LIMIT 300) AS ult ORDER BY id",
@@ -1888,6 +1979,7 @@ def api_conversacion(numero):
         "pide_vendedor": bool(c["pide_vendedor"]),
         "atiende": c["atiende"],
         "ventana": ventana_abierta(c),
+        "pedidos": n_pedidos,
         "mensajes": [{
             "id": m["id"], "quien": m["quien"], "tipo": m["tipo"], "texto": m["texto"],
             "archivo": url_media(m["archivo"]) if m["archivo"] else "",
@@ -2033,7 +2125,7 @@ def api_reporte():
     for ts in tiempos:
         d = datetime.fromtimestamp(ts, TZ_AR).strftime("%d/%m")
         por_dia[d] = por_dia.get(d, 0) + 1
-    nombres_prod = {p["clave"]: p["nombre"] for p in catalogo_actual()}
+    nombres_prod = {p["clave"]: p["nombre"] for p in catalogo_todo()}
     nombres_motivo = {
         "pedido": "Pidieron un vendedor", "precio": "Preguntaron precios", "archivo": "Mandaron foto/audio/archivo",
         "insistencia": "El bot no los entendió (2 veces)", "direccion": "Dirección (sin dato cargado)",
@@ -2055,13 +2147,17 @@ def api_reporte():
 @requiere_login
 def api_catalogo():
     salida = []
-    for p in catalogo_actual(True):
-        nombres = ([p["foto"]] if p["foto"] else []) + list(p.get("extras") or [])
+    for p in catalogo_todo(True):
+        fotos = []
+        if p["foto"]:
+            fotos.append({"nombre": p["foto"], "url": url_media(f"{p['origen']}/{p['foto']}"),
+                          "propia": p["origen"] == "m"})
+        fotos += [{"nombre": f, "url": url_media(f"m/{f}"), "propia": True} for f in (p.get("extras") or [])]
         salida.append({
             "clave": p["clave"], "nombre": p["nombre"], "texto": p["texto"],
             "palabras": ", ".join(p["terms"][1:]), "editable": p["editable"], "fuente": p["fuente"],
-            "foto": url_media(f"{p['origen']}/{p['foto']}") if p["foto"] else "",
-            "fotos": [{"nombre": f, "url": url_media(f"{p['origen']}/{f}")} for f in nombres],
+            "foto": fotos[0]["url"] if fotos else "", "fotos": fotos,
+            "categoria": p.get("categoria", ""), "activo": p.get("activo", True),
         })
     return jsonify(salida)
 
@@ -2072,6 +2168,7 @@ def api_catalogo_guardar():
     nombre = " ".join(str(request.form.get("nombre", "")).split())[:60]
     palabras = str(request.form.get("palabras", "")).strip()[:200]
     texto = str(request.form.get("texto", "")).strip()[:900]
+    categoria = " ".join(str(request.form.get("categoria", "")).split())[:24]
     clave = normalizar(nombre)
     if not clave:
         return jsonify({"ok": False, "error": "Poné el nombre del producto."}), 400
@@ -2104,10 +2201,10 @@ def api_catalogo_guardar():
         principal, extras = (todas[0] if todas else ""), ",".join(todas[1:])
         ahora_ts = time.time()
         con.execute(
-            "INSERT INTO productos (clave, nombre, palabras, texto, foto, fotos, oculto, ts) VALUES (?,?,?,?,?,?,0,?) "
-            "ON CONFLICT (clave) DO UPDATE SET nombre=?, palabras=?, texto=?, foto=?, fotos=?, oculto=0, ts=?",
-            (clave, nombre, palabras, texto, principal, extras, ahora_ts,
-             nombre, palabras, texto, principal, extras, ahora_ts),
+            "INSERT INTO productos (clave, nombre, palabras, texto, foto, fotos, oculto, categoria, ts) VALUES (?,?,?,?,?,?,0,?,?) "
+            "ON CONFLICT (clave) DO UPDATE SET nombre=?, palabras=?, texto=?, foto=?, fotos=?, oculto=0, categoria=?, ts=?",
+            (clave, nombre, palabras, texto, principal, extras, categoria, ahora_ts,
+             nombre, palabras, texto, principal, extras, categoria, ahora_ts),
         )
     for f in viejas:
         if f in quitar:
@@ -2139,6 +2236,103 @@ def api_catalogo_borrar():
             borrar_archivo(f)
     catalogo_actual(True)
     return jsonify({"ok": True})
+
+
+@app.route("/api/catalogo/activo", methods=["POST"])
+@requiere_login
+def api_catalogo_activo():
+    """Pausa (activo=false) o reactiva un producto sin borrarlo: el bot deja de ofrecerlo y avisa que no hay."""
+    datos = request.get_json(silent=True) or {}
+    clave, activo = str(datos.get("clave", "")), 1 if datos.get("activo") else 0
+    base = _catalogo_base().get(clave)
+    with tx() as con:
+        fila = con.execute("SELECT clave FROM productos WHERE clave=?", (clave,)).fetchone()
+        if fila is None and base is None:
+            return jsonify({"ok": False, "error": "No encontré ese producto."}), 404
+        if fila is None:
+            con.execute("INSERT INTO productos (clave, nombre, palabras, texto, foto, fotos, oculto, activo, ts) "
+                        "VALUES (?,?,?,?,?,?,0,?,?)", (clave, base["nombre"], "", "", "", "", activo, time.time()))
+        else:
+            con.execute("UPDATE productos SET activo=?, oculto=0, ts=? WHERE clave=?", (activo, time.time(), clave))
+    catalogo_actual(True)
+    return jsonify({"ok": True, "activo": bool(activo)})
+
+
+def _celda_texto(ws, ref, valor):
+    """Escribe texto del cliente SIEMPRE como texto (si empieza con '=' no se convierte en fórmula)."""
+    c = ws[ref]
+    c.value = str(valor)
+    c.data_type = "s"
+    return c
+
+
+def _numero_de(cantidad):
+    m = re.search(r"\d+(?:[.,]\d+)?", cantidad or "")
+    return float(m.group(0).replace(",", ".")) if m else None
+
+
+@app.route("/api/pedidos/<numero>/excel")
+@requiere_login
+def api_pedido_excel(numero):
+    """Excel del último pedido (o ?id=N) para que el vendedor complete los precios y arme el presupuesto."""
+    if not numero_valido(numero):
+        return jsonify({"error": "número inválido"}), 400
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        return jsonify({"error": "Falta instalar openpyxl (agregalo a requirements.txt)."}), 500
+    pid = request.args.get("id", type=int)
+    with tx() as con:
+        c = con.execute("SELECT * FROM conversaciones WHERE numero=?", (numero,)).fetchone()
+        if pid:
+            fila = con.execute("SELECT * FROM pedidos WHERE numero=? AND id=?", (numero, pid)).fetchone()
+        else:
+            fila = con.execute("SELECT * FROM pedidos WHERE numero=? ORDER BY id DESC LIMIT 1", (numero,)).fetchone()
+    if c is None or fila is None:
+        return jsonify({"error": "Este cliente todavía no armó ningún pedido."}), 404
+    try:
+        items = json.loads(fila["items"])
+    except ValueError:
+        items = []
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Presupuesto"
+    _celda_texto(ws, "A1", ajustes()["nombre"]).font = Font(bold=True, size=14)
+    _celda_texto(ws, "A2", "Cliente: " + titulo(c) + "  |  +" + numero)
+    _celda_texto(ws, "A3", "Pedido del " + fmt(fila["ts"]))
+    cab = ["N°", "Producto", "Cantidad pedida", "Cant.", "Precio unitario", "Subtotal"]
+    for col, t in enumerate(cab, 1):
+        x = ws.cell(row=5, column=col, value=t)
+        x.font = Font(bold=True, color="FFFFFF")
+        x.fill = PatternFill("solid", fgColor="075E54")
+        x.alignment = Alignment(horizontal="center")
+    r = 6
+    for n, it in enumerate(items, 1):
+        ws.cell(row=r, column=1, value=n)
+        _celda_texto(ws, f"B{r}", it.get("nombre", ""))
+        _celda_texto(ws, f"C{r}", it.get("cantidad", ""))
+        cant = _numero_de(it.get("cantidad", ""))
+        if cant is not None:
+            ws.cell(row=r, column=4, value=cant)
+        ws.cell(row=r, column=6, value=f'=IF(AND(ISNUMBER(D{r}),ISNUMBER(E{r})),D{r}*E{r},"")')
+        ws.cell(row=r, column=5).number_format = '"$" #,##0.00'
+        ws.cell(row=r, column=6).number_format = '"$" #,##0.00'
+        r += 1
+    ws.cell(row=r + 1, column=5, value="TOTAL").font = Font(bold=True)
+    tot = ws.cell(row=r + 1, column=6, value=f"=SUM(F6:F{max(r - 1, 6)})")
+    tot.font = Font(bold=True)
+    tot.number_format = '"$" #,##0.00'
+    _celda_texto(ws, f"A{r + 3}", "Completá la columna «Precio unitario» y el subtotal se calcula solo. "
+                                  "Si la cantidad no es un número (ej: «una bolsa»), escribila en la columna «Cant.».")
+    for col, ancho in zip("ABCDEF", (6, 38, 22, 9, 16, 16)):
+        ws.column_dimensions[col].width = ancho
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    limpio = re.sub(r"[^A-Za-z0-9_-]+", "_", normalizar(titulo(c)))[:30] or numero
+    return send_file(buf, as_attachment=True, download_name=f"pedido_{limpio}_{datetime.fromtimestamp(fila['ts'], ahora().tzinfo).strftime('%d-%m-%Y')}.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ---- AJUSTES, USUARIOS, COPIA DE SEGURIDAD (solo administrador) y /salud
@@ -2352,6 +2546,13 @@ button:disabled{opacity:.5;cursor:default}
 #emojis{display:flex;flex-wrap:wrap;gap:2px;padding:6px 10px;background:#fff;border-top:1px solid #e3e3e3;max-height:130px;overflow-y:auto}
 #emojis button{background:none;border:0;font-size:22px;padding:2px 4px;cursor:pointer;border-radius:6px}
 #emojis button:hover{background:#eee}
+#catLista{max-height:300px;overflow-y:auto}
+.filtrocat{display:flex;gap:8px;margin:6px 0}
+.filtrocat input{flex:1;min-width:0}
+.pausado .miniatura,.pausado .info{opacity:.5}
+.filtrocat input,.filtrocat select{padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit}
+.etqcat{display:inline-block;background:#e7f3ef;color:#075e54;border-radius:10px;padding:1px 8px;font-size:11px;margin-right:4px}
+.etqpausa{display:inline-block;background:#fff3cd;color:#664d03;border-radius:10px;padding:1px 8px;font-size:11px}
 #catFotos{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
 .fotoed{position:relative}
 .fotoed img{width:64px;height:64px;object-fit:cover;border-radius:6px;display:block}
@@ -2421,6 +2622,7 @@ button.mini{padding:4px 10px;font-size:13px}
     <strong id="titulo"></strong>
     <span id="nombreCaja"><input type="text" id="inputNombre" placeholder="Nombre del cliente" maxlength="60"><button class="sec" id="guardarNombre">Guardar</button></span>
     <span id="estado"></span>
+    <button class="sec oculto" id="btnExcel" title="Descargar el último pedido en Excel">📥 Pedido Excel</button>
     <button class="sec oculto" id="devolver">Devolver al bot</button>
    </div>
    <div id="avisoVentana" class="oculto">⏳ Pasaron más de 24 hs desde el último mensaje del cliente: WhatsApp no deja escribirle primero. Esperá a que él escriba.</div>
@@ -2440,10 +2642,17 @@ button.mini{padding:4px 10px;font-size:13px}
 <div id="modalCat" class="oculto"><div class="caja">
  <h2>📦 Catálogo del bot</h2>
  <p class="suave">Subí una foto con el nombre del producto y el bot lo reconoce al instante, sin tocar el código. No pongas precios.</p>
+ <div class="filtrocat">
+  <input type="search" id="catBuscar" placeholder="🔎 Buscar producto o categoría..." autocomplete="off">
+  <select id="catFiltro"><option value="">Todas las categorías</option></select>
+ </div>
+ <div id="catResumen" class="suave"></div>
  <div id="catLista"></div>
  <h3 id="catTitulo">Agregar producto</h3>
  <div class="formcat">
   <input type="text" id="catNombre" placeholder="Nombre (ej: Cemento portland)" maxlength="60">
+  <input type="text" id="catCategoria" list="catCategorias" placeholder="Categoría (ej: Electricidad, Ferretería, Pinturas)" maxlength="24">
+  <datalist id="catCategorias"></datalist>
   <input type="text" id="catPalabras" placeholder="También se busca como, separado por comas (ej: cemento, portland)" maxlength="200">
   <textarea id="catTexto" placeholder="Descripción que ve el cliente (opcional)" maxlength="900"></textarea>
   <div class="suave">Fotos del producto (hasta 6; la primera es la principal)</div>
@@ -2676,6 +2885,7 @@ async function cargarChat(bajar) {
     if (document.activeElement !== inp) inp.value = d.nombre || "";
     $("estado").textContent = d.humano ? (d.atiende ? "👤 Atiende " + d.atiende : "👤 Atiende una persona") : "🤖 Atiende el bot";
     $("devolver").classList.toggle("oculto", !d.humano);
+    $("btnExcel").classList.toggle("oculto", !d.pedidos);
     ventanaAbierta = d.ventana;
     $("avisoVentana").classList.toggle("oculto", d.ventana);
     actualizarControles();
@@ -2765,6 +2975,7 @@ $("inputArchivo").addEventListener("change", enviarArchivo);
 $("guardarNombre").addEventListener("click", guardarNombre);
 $("inputNombre").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); guardarNombre(); } });
 $("devolver").addEventListener("click", devolver);
+$("btnExcel").addEventListener("click", () => { if (actual) window.location.href = "/api/pedidos/" + actual + "/excel"; });
 const EMOJIS = "😀 😃 😄 😁 😊 🙂 😉 😍 🤗 😎 🤝 🙌 👍 👌 👏 🙏 💪 ✅ ❌ ⚠️ ⭐ 🔥 ❤️ 💙 🎉 😅 😂 🤔 😢 🙁 😮 👋 👉 👇 📍 🕒 📞 📦 🧱 🛠️ 🔧 🔨 🪛 🪚 🧰 🔩 🚚 💳 💵 🏠".split(" ");
 EMOJIS.forEach(e => {
   const b = el("button", "", e); b.type = "button";
@@ -2829,51 +3040,86 @@ function pintarFotosEd() {
     const im = el("img"); im.src = f.url; im.alt = "";
     const x = el("button", "", "✕"); x.type = "button"; x.title = "Quitar esta foto";
     x.addEventListener("click", () => { quitarEd.add(f.nombre); pintarFotosEd(); });
-    d.appendChild(im); d.appendChild(x);
+    d.appendChild(im);
+    if (f.propia !== false) d.appendChild(x);
     if (i === 0) d.appendChild(el("div", "princ", "principal"));
     caja.appendChild(d);
   });
 }
 function limpiarFormCat() {
-  $("catNombre").value = ""; $("catPalabras").value = ""; $("catTexto").value = ""; $("catFoto").value = "";
+  $("catNombre").value = ""; $("catPalabras").value = ""; $("catTexto").value = ""; $("catFoto").value = ""; $("catCategoria").value = "";
   $("catTitulo").textContent = "Agregar producto";
   fotosEd = []; quitarEd = new Set(); pintarFotosEd();
 }
-async function cargarCatalogo() {
+let catDatos = [];
+function pintarCatalogo() {
   const caja = $("catLista");
   vaciar(caja);
-  const r = await api("/api/catalogo");
-  if (!r.ok || !Array.isArray(r.data)) { caja.appendChild(el("p", "suave", "No se pudo cargar el catálogo.")); return; }
-  if (!r.data.length) caja.appendChild(el("p", "suave", "Todavía no hay productos."));
-  r.data.forEach(p => {
-    const fila = el("div", "prodcat");
+  const q = normalizarJs($("catBuscar").value), filtro = $("catFiltro").value;
+  const lista = catDatos.filter(p => {
+    if (filtro === "__pausados") { if (p.activo) return false; }
+    else if (filtro === "__sin") { if (p.categoria) return false; }
+    else if (filtro && p.categoria !== filtro) return false;
+    return !q || normalizarJs(p.nombre + " " + p.categoria + " " + p.palabras).includes(q);
+  });
+  $("catResumen").textContent = lista.length === catDatos.length
+    ? catDatos.length + " productos" : lista.length + " de " + catDatos.length + " productos";
+  if (!lista.length) caja.appendChild(el("p", "suave", catDatos.length ? "No hay productos con ese filtro." : "Todavía no hay productos."));
+  lista.forEach(p => {
+    const fila = el("div", "prodcat" + (p.activo ? "" : " pausado"));
     if (p.foto) { const im = el("img", "miniatura"); im.src = p.foto; im.alt = ""; fila.appendChild(im); }
     else fila.appendChild(el("div", "miniatura", "—"));
     const info = el("div", "info");
     info.appendChild(el("b", "", p.nombre));
-    info.appendChild(el("div", "suave", p.fuente === "panel" ? "Cargado desde el panel" : "Viene de GitHub (" + p.fuente + ")"));
+    const sub = el("div", "suave");
+    if (p.categoria) sub.appendChild(el("span", "etqcat", p.categoria));
+    if (!p.activo) sub.appendChild(el("span", "etqpausa", "⏸ Pausado: no lo ofrece el bot"));
+    if (!p.categoria && p.activo) sub.appendChild(document.createTextNode(p.fuente === "panel" ? "Sin categoría" : "Sin categoría · viene de GitHub"));
+    info.appendChild(sub);
     fila.appendChild(info);
-    if (p.editable) {
-      const ed = el("button", "sec mini", "Editar");
-      ed.addEventListener("click", () => {
-        $("catNombre").value = p.nombre; $("catPalabras").value = p.palabras; $("catTexto").value = p.texto;
-        $("catTitulo").textContent = "Editando: " + p.nombre + " (podés sumar o quitar fotos)";
-        fotosEd = p.fotos || []; quitarEd = new Set(); pintarFotosEd();
-        $("catNombre").focus();
-      });
-      fila.appendChild(ed);
-    }
+    const ed = el("button", "sec mini", "Editar");
+    ed.addEventListener("click", () => {
+      $("catNombre").value = p.nombre; $("catPalabras").value = p.palabras; $("catTexto").value = p.texto;
+      $("catCategoria").value = p.categoria || "";
+      $("catTitulo").textContent = "Editando: " + p.nombre + " (podés sumar o quitar fotos)";
+      fotosEd = p.fotos || []; quitarEd = new Set(); pintarFotosEd();
+      $("catNombre").focus();
+    });
+    const pa = el("button", "sec mini", p.activo ? "Pausar" : "Activar");
+    pa.title = p.activo ? "No lo tenemos por ahora: el bot deja de ofrecerlo (no se borra)" : "Volver a ofrecerlo";
+    pa.addEventListener("click", async () => {
+      const rr = await api("/api/catalogo/activo", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clave: p.clave, activo: !p.activo }) });
+      if (!(rr.ok && rr.data && rr.data.ok)) toast((rr.data && rr.data.error) || "No se pudo cambiar", true);
+      cargarCatalogo().catch(() => {});
+    });
     const bo = el("button", "sec mini", "Borrar");
     bo.addEventListener("click", async () => {
-      if (!confirm("¿Borrar " + p.nombre + " del catálogo?")) return;
+      if (!confirm("¿Borrar " + p.nombre + " del catálogo? (Si solo no tenés stock, usá Pausar.)")) return;
       const rr = await api("/api/catalogo/borrar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clave: p.clave }) });
       if (!(rr.ok && rr.data && rr.data.ok)) toast((rr.data && rr.data.error) || "No se pudo borrar", true);
       cargarCatalogo().catch(() => {});
     });
-    fila.appendChild(bo);
+    fila.appendChild(ed); fila.appendChild(pa); fila.appendChild(bo);
     caja.appendChild(fila);
   });
 }
+function normalizarJs(t) { return (t || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+async function cargarCatalogo() {
+  const r = await api("/api/catalogo");
+  if (!r.ok || !Array.isArray(r.data)) { vaciar($("catLista")); $("catLista").appendChild(el("p", "suave", "No se pudo cargar el catálogo.")); return; }
+  catDatos = r.data;
+  const cats = [...new Set(catDatos.map(p => p.categoria).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const actual = $("catFiltro").value;
+  vaciar($("catFiltro")); vaciar($("catCategorias"));
+  [["", "Todas las categorías"], ...cats.map(c => [c, c]), ["__sin", "Sin categoría"], ["__pausados", "⏸ Pausados"]].forEach(([v, t]) => {
+    const o = el("option", "", t); o.value = v; $("catFiltro").appendChild(o);
+  });
+  cats.forEach(c => { const o = el("option"); o.value = c; $("catCategorias").appendChild(o); });
+  $("catFiltro").value = [...$("catFiltro").options].some(o => o.value === actual) ? actual : "";
+  pintarCatalogo();
+}
+$("catBuscar").addEventListener("input", pintarCatalogo);
+$("catFiltro").addEventListener("change", pintarCatalogo);
 async function guardarProducto() {
   const nombre = $("catNombre").value.trim();
   if (!nombre) { toast("Poné el nombre del producto", true); return; }
@@ -2882,6 +3128,7 @@ async function guardarProducto() {
     const fd = new FormData();
     fd.append("nombre", nombre);
     fd.append("palabras", $("catPalabras").value.trim());
+    fd.append("categoria", $("catCategoria").value.trim());
     fd.append("texto", $("catTexto").value.trim());
     const archivos = Array.from($("catFoto").files);
     for (const f of archivos) fd.append("fotos", await reducirImagen(f), "foto.jpg");
@@ -2953,7 +3200,7 @@ async function guardarAjustes() {
         turnos: turnosEd
       })
     });
-    if (r.ok && r.data && r.data.ok) { toast("Guardado. El bot ya usa los datos nuevos."); await cargarAjustes(); }
+    if (r.ok && r.data && r.data.ok) { toast("Guardado. El bot ya usa los datos nuevos."); await cargarAjustes(); refrescarRapidas().catch(() => {}); }
     else toast((r.data && r.data.error) || "No se pudo guardar.", true);
   } catch (e) { if (e.message !== "sin sesión") toast("Error de conexión.", true); }
   $("ajGuardar").disabled = false;
@@ -3002,16 +3249,13 @@ $("ajGuardar").addEventListener("click", guardarAjustes);
 $("usrCrear").addEventListener("click", () => { crearUsuario().catch(() => {}); });
 $("btnBackup").addEventListener("click", () => { window.location.href = "/api/backup"; });
 
-/* ---------- arranque ---------- */
-api("/api/config").then(r => {
-  if (!r.ok || !r.data) return;
-  $("quienSoy").textContent = "👤 " + (r.data.nombre || "");
-  if (r.data.rol === "admin") $("btnAjustes").classList.remove("oculto");
-  $("modoDb").textContent = r.data.db === "supabase" ? "🟢 Datos guardados en Supabase" : "⚠️ Base temporal: se borra al reiniciar";
+/* ---------- mensajes rápidos (se vuelven a cargar al guardar los ajustes, así el link de calificación se actualiza) ---------- */
+function pintarRapidas(cfg) {
   const caja = $("rapidas");
-  const frases = [r.data.resena, ...(r.data.rapidas || [])].filter(Boolean);
+  vaciar(caja);
+  const frases = [cfg.resena, ...(cfg.rapidas || [])].filter(Boolean);
   frases.forEach((t, i) => {
-    const b = el("button", "chip", i === 0 && r.data.resena ? "⭐ Pedir calificación" : (t.length > 30 ? t.slice(0, 30) + "…" : t));
+    const b = el("button", "chip", i === 0 && cfg.resena ? "⭐ Pedir calificación" : (t.length > 30 ? t.slice(0, 30) + "…" : t));
     b.title = t;
     b.addEventListener("click", () => {
       const ta = $("texto");
@@ -3020,7 +3264,20 @@ api("/api/config").then(r => {
     });
     caja.appendChild(b);
   });
-  if (!caja.children.length) caja.classList.add("oculto");
+  caja.classList.toggle("oculto", !caja.children.length);
+}
+async function refrescarRapidas() {
+  const r = await api("/api/config");
+  if (r.ok && r.data) pintarRapidas(r.data);
+}
+
+/* ---------- arranque ---------- */
+api("/api/config").then(r => {
+  if (!r.ok || !r.data) return;
+  $("quienSoy").textContent = "👤 " + (r.data.nombre || "");
+  if (r.data.rol === "admin") $("btnAjustes").classList.remove("oculto");
+  $("modoDb").textContent = r.data.db === "supabase" ? "🟢 Datos guardados en Supabase" : "⚠️ Base temporal: se borra al reiniciar";
+  pintarRapidas(r.data);
 }).catch(() => {});
 cargarLista().catch(() => {});
 setInterval(() => { cargarLista().catch(() => {}); cargarChat(false).catch(() => {}); }, 4000);
