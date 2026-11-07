@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 10: buscador y categorías en el catálogo, pausar productos, Excel del pedido)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 11: aceptar conversaciones derivadas (el bot sigue ayudando hasta que un vendedor acepta))
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -1453,8 +1453,29 @@ def manejar_espera(numero, texto, espera):
     return True
 
 
+def esperando_vendedor(c):
+    """Derivada pero todavía ningún vendedor la aceptó ni respondió: el bot sigue ayudando con lo básico."""
+    return bool(c and c["humano"] and c["pide_vendedor"] and not c["atiende"])
+
+
+def bot_callado(c):
+    """True cuando ya la atiende una persona (la aceptó o respondió): el bot no dice nada."""
+    return bool(c and c["humano"] and not esperando_vendedor(c))
+
+
+def avisar_espera(numero):
+    decir_botones(numero, "🔔 Ya avisamos a un vendedor: te responde en un momento por acá. "
+                          "Mientras tanto, si querés, mirá horarios o productos 👇",
+                  [("horarios", "🕒 Horarios"), ("productos", "🧱 Productos")],
+                  "Mientras esperás podés escribir *HORARIOS* o *PRODUCTOS*.")
+
+
 def derivar(numero, motivo, mensaje):
-    """Pasa la conversación a una persona: el bot se calla y el panel marca el 🔔."""
+    """Pasa la conversación a una persona y el panel marca el 🔔. Mientras ningún vendedor la acepte,
+    el bot sigue contestando horarios, productos, etc. (no vuelve a derivar ni dice 'no entendí')."""
+    if esperando_vendedor(conv(numero)):
+        evento("vendedor_repetido", motivo)
+        return avisar_espera(numero)
     evento("vendedor", motivo)
     marcar(numero, humano=1, pide_vendedor=1, pide_desde=time.time(), fallos=0, atiende="")
     if not abierto_ahora():
@@ -1539,13 +1560,18 @@ def responder(numero, texto, primer_mensaje):
         mostrar_productos(numero)
     elif tiene(t, PALABRAS_MENU) or tiene(t, PALABRAS_SALUDO):
         evento("saludo")
-        decir_menu(numero, saludo_texto())
+        if esperando_vendedor(c):
+            avisar_espera(numero)
+        else:
+            decir_menu(numero, saludo_texto())
     elif primer_mensaje:
         evento("no_entendido", texto)  # lo anotamos, pero primero lo saludamos
         decir_menu(numero, saludo_texto())
         return
     else:
         evento("no_entendido", texto)
+        if esperando_vendedor(c):
+            return  # ya lo va a leer un vendedor: no lo llenamos de "no te entendí"
         if sumar_fallo(numero) >= MAX_FALLOS:
             return derivar(numero, "insistencia", DERIVACION_INSISTENCIA)
         decir_menu(numero, "No te entendí del todo 🙈")
@@ -1584,7 +1610,7 @@ def _esperar_y_responder(numero):
                     break
         with lock_de(numero):
             c = conv(numero)
-            if c and c["humano"]:
+            if bot_callado(c):
                 return  # mientras tanto lo tomó un vendedor
             responder(numero, " ".join(textos), es_primer_mensaje(numero))
     except Exception:
@@ -1681,8 +1707,8 @@ def procesar_mensaje(msg, perfil=""):
         if perfil:
             marcar(numero, perfil=perfil[:60])
 
-        if conv(numero)["humano"]:
-            return  # atiende una persona: el bot se queda callado
+        if bot_callado(conv(numero)):
+            return  # ya lo atiende una persona: el bot se queda callado
 
         if es_archivo:
             evento("archivo", tipo)
@@ -2083,6 +2109,18 @@ def api_enviar_archivo():
     registrar(numero, "vendedor", tipo, caption, archivo="m/" + nombre,
               nombre_archivo=nombre_mostrado if tipo == "document" else "", wamid=wamid, estado="sent",
               autor=quien())
+    _despues_de_enviar(numero)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/aceptar", methods=["POST"])
+@requiere_login
+def api_aceptar():
+    """El vendedor toma la conversación: desde acá el bot se calla del todo."""
+    numero = str((request.get_json(silent=True) or {}).get("numero", ""))
+    if not numero_valido(numero) or conv(numero) is None:
+        return jsonify({"ok": False, "error": "Número inválido"}), 400
+    evento("vendedor_acepto")
     _despues_de_enviar(numero)
     return jsonify({"ok": True})
 
@@ -2622,6 +2660,7 @@ button.mini{padding:4px 10px;font-size:13px}
     <strong id="titulo"></strong>
     <span id="nombreCaja"><input type="text" id="inputNombre" placeholder="Nombre del cliente" maxlength="60"><button class="sec" id="guardarNombre">Guardar</button></span>
     <span id="estado"></span>
+    <button class="oculto" id="btnAceptar" title="Tomar esta conversación: el bot deja de contestar">✋ Aceptar</button>
     <button class="sec oculto" id="btnExcel" title="Descargar el último pedido en Excel">📥 Pedido Excel</button>
     <button class="sec oculto" id="devolver">Devolver al bot</button>
    </div>
@@ -2883,7 +2922,11 @@ async function cargarChat(bajar) {
     $("titulo").textContent = d.titulo;
     const inp = $("inputNombre");
     if (document.activeElement !== inp) inp.value = d.nombre || "";
-    $("estado").textContent = d.humano ? (d.atiende ? "👤 Atiende " + d.atiende : "👤 Atiende una persona") : "🤖 Atiende el bot";
+    $("estado").textContent = d.humano
+      ? (d.pide_vendedor && !d.atiende ? "🔔 Espera vendedor · el bot sigue con horarios y productos"
+         : (d.atiende ? "👤 Atiende " + d.atiende : "👤 Atiende una persona"))
+      : "🤖 Atiende el bot";
+    $("btnAceptar").classList.toggle("oculto", !(d.humano && d.pide_vendedor));
     $("devolver").classList.toggle("oculto", !d.humano);
     $("btnExcel").classList.toggle("oculto", !d.pedidos);
     ventanaAbierta = d.ventana;
@@ -2975,6 +3018,13 @@ $("inputArchivo").addEventListener("change", enviarArchivo);
 $("guardarNombre").addEventListener("click", guardarNombre);
 $("inputNombre").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); guardarNombre(); } });
 $("devolver").addEventListener("click", devolver);
+$("btnAceptar").addEventListener("click", async () => {
+  if (!actual) return;
+  const r = await api("/api/aceptar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual }) });
+  if (!(r.ok && r.data && r.data.ok)) { toast("No se pudo aceptar", true); return; }
+  toast("Listo, ahora la atendés vos. El bot se calla.");
+  await cargarChat(false).catch(() => {}); cargarLista().catch(() => {});
+});
 $("btnExcel").addEventListener("click", () => { if (actual) window.location.href = "/api/pedidos/" + actual + "/excel"; });
 const EMOJIS = "😀 😃 😄 😁 😊 🙂 😉 😍 🤗 😎 🤝 🙌 👍 👌 👏 🙏 💪 ✅ ❌ ⚠️ ⭐ 🔥 ❤️ 💙 🎉 😅 😂 🤔 😢 🙁 😮 👋 👉 👇 📍 🕒 📞 📦 🧱 🛠️ 🔧 🔨 🪛 🪚 🧰 🔩 🚚 💳 💵 🏠".split(" ");
 EMOJIS.forEach(e => {
