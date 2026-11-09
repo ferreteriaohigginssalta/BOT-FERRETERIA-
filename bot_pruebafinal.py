@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 11: aceptar conversaciones derivadas (el bot sigue ayudando hasta que un vendedor acepta))
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 12: enviar Excel/Word y productos del catálogo desde el chat)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -43,6 +43,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import zipfile
 from contextlib import contextmanager
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
@@ -2054,7 +2055,32 @@ def api_enviar():
     return jsonify({"ok": True})
 
 
-def detectar_tipo(datos):
+OFFICE_MODERNO = (  # carpeta interna del .zip -> (extensión, tipo MIME)
+    ("xl/", ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("word/", ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("ppt/", ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+)
+OFFICE_VIEJO = {  # Excel/Word/PowerPoint de antes de 2007 (se reconocen por el contenido y la extensión)
+    ".xls": "application/vnd.ms-excel", ".doc": "application/msword", ".ppt": "application/vnd.ms-powerpoint",
+}
+
+
+def _tipo_office(datos):
+    """Un .xlsx/.docx/.pptx de verdad es un zip con [Content_Types].xml y su carpeta. Sin macros."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(datos)) as z:
+            nombres = z.namelist()
+    except (zipfile.BadZipFile, ValueError):
+        return None
+    if "[Content_Types].xml" not in nombres or any(n.lower().endswith("vbaproject.bin") for n in nombres):
+        return None
+    for carpeta, ext, mime in OFFICE_MODERNO:
+        if any(n.startswith(carpeta) for n in nombres):
+            return ext, mime
+    return None
+
+
+def detectar_tipo(datos, nombre=""):
     """Mira el contenido real del archivo (no solo el nombre)."""
     if datos.startswith(b"\xff\xd8\xff"):
         return "image", ".jpg", "image/jpeg"
@@ -2062,6 +2088,14 @@ def detectar_tipo(datos):
         return "image", ".png", "image/png"
     if datos.startswith(b"%PDF"):
         return "document", ".pdf", "application/pdf"
+    if datos.startswith(b"PK\x03\x04"):
+        t = _tipo_office(datos)
+        if t:
+            return "document", t[0], t[1]
+    if datos.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        ext = os.path.splitext(nombre or "")[1].lower()
+        if ext in OFFICE_VIEJO:
+            return "document", ext, OFFICE_VIEJO[ext]
     return None, None, None
 
 
@@ -2080,15 +2114,16 @@ def api_enviar_archivo():
         return jsonify({"ok": False, "error": MSG_VENTANA}), 409
 
     datos = archivo.read()
-    tipo, ext, mime = detectar_tipo(datos)
+    tipo, ext, mime = detectar_tipo(datos, archivo.filename or "")
     if not tipo:
-        return jsonify({"ok": False, "error": "Solo se pueden enviar fotos JPG o PNG y archivos PDF."}), 400
+        return jsonify({"ok": False, "error": "Solo se pueden enviar fotos JPG o PNG, PDF, Excel (.xlsx), Word (.docx) o PowerPoint (.pptx). "
+                                               "Los archivos con macros no."}), 400
     if len(datos) > (MAX_FOTO if tipo == "image" else MAX_PDF):
-        return jsonify({"ok": False, "error": "El archivo es demasiado pesado (fotos hasta 5 MB, PDF hasta 16 MB)."}), 400
+        return jsonify({"ok": False, "error": "El archivo es demasiado pesado (fotos hasta 5 MB, documentos hasta 16 MB)."}), 400
 
     nombre = uuid.uuid4().hex + ext
     guardar_archivo(nombre, datos, mime)
-    nombre_mostrado = secure_filename(archivo.filename or "")[:80] or ("documento.pdf" if tipo == "document" else "foto" + ext)
+    nombre_mostrado = secure_filename(archivo.filename or "")[:80] or ("documento" + ext if tipo == "document" else "foto" + ext)
 
     media_id, error = subir_media(nombre, datos, mime)
     if not media_id:
@@ -2109,6 +2144,45 @@ def api_enviar_archivo():
     registrar(numero, "vendedor", tipo, caption, archivo="m/" + nombre,
               nombre_archivo=nombre_mostrado if tipo == "document" else "", wamid=wamid, estado="sent",
               autor=quien())
+    _despues_de_enviar(numero)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/enviar_producto", methods=["POST"])
+@requiere_login
+def api_enviar_producto():
+    """El vendedor, charlando, manda un producto del catálogo: foto con nombre y descripción (+ las otras fotos)."""
+    datos = request.get_json(silent=True) or {}
+    numero, clave = str(datos.get("numero", "")), str(datos.get("clave", ""))
+    if not numero_valido(numero):
+        return jsonify({"ok": False, "error": "Faltan datos"}), 400
+    c = conv(numero)
+    if c is None:
+        return jsonify({"ok": False, "error": "La conversación no existe"}), 404
+    if not ventana_abierta(c):
+        return jsonify({"ok": False, "error": MSG_VENTANA}), 409
+    p = next((x for x in catalogo_todo(True) if x["clave"] == clave), None)
+    if p is None:
+        return jsonify({"ok": False, "error": "No encontré ese producto."}), 404
+    caption = f"*{p['nombre']}*" + (f"\n{p['texto']}" if p.get("texto") else "")
+    if p.get("foto"):
+        ok, wamid, error = enviar_foto(numero, p["origen"], p["foto"], caption)
+        if not ok:
+            return jsonify({"ok": False, "error": error or "No se pudo enviar la foto"}), 502
+        registrar(numero, "vendedor", "image", caption, archivo=f"{p['origen']}/{p['foto']}",
+                  wamid=wamid, estado="sent", autor=quien())
+        for f in (p.get("extras") or [])[:MAX_FOTOS_PRODUCTO - 1]:
+            ok2, wamid2, error2 = enviar_foto(numero, "m", f, "")
+            if ok2:
+                registrar(numero, "vendedor", "image", "", archivo=f"m/{f}", wamid=wamid2, estado="sent", autor=quien())
+            else:
+                log.warning("No pude mandar la foto extra %s (%s)", f, error2)
+    else:
+        ok, wamid, error = enviar_texto(numero, caption)
+        if not ok:
+            return jsonify({"ok": False, "error": error}), 502
+        registrar(numero, "vendedor", "text", caption, wamid=wamid, estado="sent", autor=quien())
+    evento("producto_enviado_vendedor", clave)
     _despues_de_enviar(numero)
     return jsonify({"ok": True})
 
@@ -2591,6 +2665,12 @@ button:disabled{opacity:.5;cursor:default}
 .filtrocat input,.filtrocat select{padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit}
 .etqcat{display:inline-block;background:#e7f3ef;color:#075e54;border-radius:10px;padding:1px 8px;font-size:11px;margin-right:4px}
 .etqpausa{display:inline-block;background:#fff3cd;color:#664d03;border-radius:10px;padding:1px 8px;font-size:11px}
+#selProd{background:#fff;border-top:1px solid #e3e3e3;padding:8px 10px}
+#selProd input{width:100%;box-sizing:border-box;padding:7px;border:1px solid #ccc;border-radius:8px;font:inherit}
+#prodLista{max-height:190px;overflow-y:auto;margin-top:6px}
+.prodsel{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #f0f0f0}
+.prodsel .miniatura{width:38px;height:38px;flex:none}
+.prodsel .info{flex:1;min-width:0;font-size:14px}
 #catFotos{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
 .fotoed{position:relative}
 .fotoed img{width:64px;height:64px;object-fit:cover;border-radius:6px;display:block}
@@ -2666,10 +2746,15 @@ button.mini{padding:4px 10px;font-size:13px}
    </div>
    <div id="avisoVentana" class="oculto">⏳ Pasaron más de 24 hs desde el último mensaje del cliente: WhatsApp no deja escribirle primero. Esperá a que él escriba.</div>
    <div id="msgs"></div>
+   <div id="selProd" class="oculto">
+    <input type="search" id="prodBuscar" placeholder="🔎 Buscar producto para mandar..." autocomplete="off">
+    <div id="prodLista"></div>
+   </div>
    <div id="emojis" class="oculto"></div>
    <div id="rapidas"></div>
    <div id="form">
-    <label class="adjuntar" title="Adjuntar foto o PDF">📎<input type="file" id="inputArchivo" accept="image/*,.pdf,application/pdf" class="oculto"></label>
+    <label class="adjuntar" title="Adjuntar foto, PDF, Excel o Word">📎<input type="file" id="inputArchivo" accept="image/*,.pdf,application/pdf,.xlsx,.xls,.docx,.doc,.pptx,.ppt" class="oculto"></label>
+    <button type="button" class="emojibtn" id="btnProd" title="Mandar un producto del catálogo">📦</button>
     <button type="button" class="emojibtn" id="btnEmoji" title="Emojis">😀</button>
     <textarea id="texto" placeholder="Escribí tu respuesta..."></textarea>
     <button id="enviar">Enviar</button>
@@ -2861,6 +2946,7 @@ function actualizarControles() {
   $("texto").disabled = !ventanaAbierta || enviando;
   $("enviar").disabled = !ventanaAbierta || enviando;
   $("inputArchivo").disabled = !ventanaAbierta || enviando;
+  $("btnProd").disabled = !ventanaAbierta || enviando;
 }
 const NOMBRES = { cliente: "Cliente", bot: "Bot", vendedor: "Vendedor" };
 function pintarMensaje(m, box) {
@@ -3018,6 +3104,50 @@ $("inputArchivo").addEventListener("change", enviarArchivo);
 $("guardarNombre").addEventListener("click", guardarNombre);
 $("inputNombre").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); guardarNombre(); } });
 $("devolver").addEventListener("click", devolver);
+/* ---------- mandar un producto del catálogo desde el chat ---------- */
+let prodDatos = [];
+function pintarProdSel() {
+  const caja = $("prodLista");
+  vaciar(caja);
+  const q = normalizarJs($("prodBuscar").value);
+  const lista = prodDatos.filter(p => !q || normalizarJs(p.nombre + " " + p.categoria + " " + p.palabras).includes(q));
+  if (!lista.length) caja.appendChild(el("p", "suave", prodDatos.length ? "No hay productos con ese nombre." : "El catálogo está vacío."));
+  lista.slice(0, 60).forEach(p => {
+    const fila = el("div", "prodsel" + (p.activo ? "" : " pausado"));
+    if (p.foto) { const im = el("img", "miniatura"); im.src = p.foto; im.alt = ""; fila.appendChild(im); }
+    else fila.appendChild(el("div", "miniatura", "—"));
+    const info = el("div", "info");
+    info.appendChild(el("b", "", p.nombre));
+    const sub = el("div", "suave", (p.categoria || "") + (p.activo ? "" : " · ⏸ pausado"));
+    info.appendChild(sub);
+    fila.appendChild(info);
+    const b = el("button", "sec mini", "Enviar");
+    b.addEventListener("click", async () => {
+      if (!actual || enviando) return;
+      if (!p.activo && !confirm(p.nombre + " está pausado (no lo tenemos). ¿Mandarlo igual?")) return;
+      enviando = true; actualizarControles(); b.disabled = true;
+      try {
+        const r = await api("/api/enviar_producto", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual, clave: p.clave }) });
+        if (r.ok && r.data && r.data.ok) toast("Enviado: " + p.nombre);
+        else toast("No se pudo enviar: " + ((r.data && r.data.error) || "error"), true);
+      } catch (e) { if (e.message !== "sin sesión") toast("Error de conexión.", true); }
+      enviando = false; actualizarControles(); b.disabled = false;
+      cargarChat(true).catch(() => {}); cargarLista().catch(() => {});
+    });
+    fila.appendChild(b);
+    caja.appendChild(fila);
+  });
+}
+$("btnProd").addEventListener("click", async () => {
+  const abrir = $("selProd").classList.contains("oculto");
+  $("selProd").classList.toggle("oculto", !abrir);
+  if (!abrir) return;
+  $("emojis").classList.add("oculto");
+  const r = await api("/api/catalogo");
+  if (r.ok && Array.isArray(r.data)) { prodDatos = r.data; pintarProdSel(); $("prodBuscar").focus(); }
+  else toast("No se pudo cargar el catálogo.", true);
+});
+$("prodBuscar").addEventListener("input", pintarProdSel);
 $("btnAceptar").addEventListener("click", async () => {
   if (!actual) return;
   const r = await api("/api/aceptar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual }) });
@@ -3036,7 +3166,7 @@ EMOJIS.forEach(e => {
   });
   $("emojis").appendChild(b);
 });
-$("btnEmoji").addEventListener("click", () => $("emojis").classList.toggle("oculto"));
+$("btnEmoji").addEventListener("click", () => { $("emojis").classList.toggle("oculto"); $("selProd").classList.add("oculto"); });
 $("texto").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } });
 $("atras").addEventListener("click", () => {
   actual = null;
