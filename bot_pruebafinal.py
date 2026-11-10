@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 13: fotos y archivos seguidos se contestan una sola vez)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 14: borrar mensajes y chats, ampliar imágenes)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -2221,6 +2221,71 @@ def api_enviar_producto():
     return jsonify({"ok": True})
 
 
+def _limpiar_archivos_sueltos(nombres):
+    """Borra de la base los archivos subidos desde el panel que ya no usa ningún mensaje ni producto."""
+    for nombre in set(nombres):
+        with tx() as con:
+            ref = "m/" + nombre
+            en_msg = con.execute("SELECT 1 FROM mensajes WHERE archivo=? LIMIT 1", (ref,)).fetchone()
+            en_prod = con.execute(
+                "SELECT 1 FROM productos WHERE foto=? OR fotos=? OR fotos LIKE ? OR fotos LIKE ? OR fotos LIKE ? LIMIT 1",
+                (nombre, nombre, nombre + ",%", "%," + nombre, "%," + nombre + ",%")).fetchone()
+        if not en_msg and not en_prod:
+            borrar_archivo(nombre)
+
+
+def _archivos_de(filas):
+    return [f["archivo"][2:] for f in filas if (f["archivo"] or "").startswith("m/") and secure_filename(f["archivo"][2:]) == f["archivo"][2:]]
+
+
+@app.route("/api/mensajes/borrar", methods=["POST"])
+@requiere_admin
+def api_mensaje_borrar():
+    """Saca un mensaje del panel. OJO: en el WhatsApp del cliente NO se puede borrar (Meta no lo permite)."""
+    d = request.get_json(silent=True) or {}
+    numero, mid = str(d.get("numero", "")), d.get("id")
+    if not numero_valido(numero) or not isinstance(mid, int):
+        return jsonify({"ok": False, "error": "Faltan datos"}), 400
+    with lock_de(numero):
+        with tx() as con:
+            m = con.execute("SELECT id, archivo FROM mensajes WHERE id=? AND numero=?", (mid, numero)).fetchone()
+            if m is None:
+                return jsonify({"ok": False, "error": "No encontré ese mensaje."}), 404
+            con.execute("DELETE FROM mensajes WHERE id=? AND numero=?", (mid, numero))
+            ult = con.execute("SELECT quien, tipo, texto, ts FROM mensajes WHERE numero=? ORDER BY id DESC LIMIT 1",
+                              (numero,)).fetchone()
+            if ult:
+                con.execute("UPDATE conversaciones SET ult_texto=? WHERE numero=?",
+                            (vista_previa(ult["quien"], ult["tipo"], ult["texto"]), numero))
+            else:
+                con.execute("UPDATE conversaciones SET ult_texto='' WHERE numero=?", (numero,))
+        _limpiar_archivos_sueltos(_archivos_de([m]))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/conversaciones/borrar", methods=["POST"])
+@requiere_admin
+def api_conversacion_borrar():
+    """Borra el chat entero del panel (mensajes, pedido en curso y pedidos). El cliente no se entera.
+    Si vuelve a escribir, empieza una conversación nueva."""
+    numero = str((request.get_json(silent=True) or {}).get("numero", ""))
+    if not numero_valido(numero):
+        return jsonify({"ok": False, "error": "Número inválido"}), 400
+    with lock_de(numero):
+        with tx() as con:
+            if con.execute("SELECT 1 FROM conversaciones WHERE numero=?", (numero,)).fetchone() is None:
+                return jsonify({"ok": False, "error": "La conversación no existe."}), 404
+            archivos = _archivos_de(con.execute("SELECT archivo FROM mensajes WHERE numero=?", (numero,)).fetchall())
+            for tabla in ("mensajes", "carrito", "pedidos", "conversaciones"):
+                con.execute(f"DELETE FROM {tabla} WHERE numero=?", (numero,))  # nombres fijos de este archivo
+        _limpiar_archivos_sueltos(archivos)
+    with _pend_lock:
+        _pendientes.pop(numero, None)
+    _aviso_espera.pop(numero, None)
+    evento("chat_borrado")
+    return jsonify({"ok": True})
+
+
 @app.route("/api/aceptar", methods=["POST"])
 @requiere_login
 def api_aceptar():
@@ -2705,6 +2770,18 @@ button:disabled{opacity:.5;cursor:default}
 .prodsel{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #f0f0f0}
 .prodsel .miniatura{width:38px;height:38px;flex:none}
 .prodsel .info{flex:1;min-width:0;font-size:14px}
+button.peligro{background:#b00020;color:#fff;border:0;border-radius:8px;padding:8px 12px;font:inherit;cursor:pointer}
+.borrarmsg{background:none;border:0;cursor:pointer;opacity:.3;font-size:12px;padding:0 2px}
+.msg:hover .borrarmsg{opacity:.9}
+.miniatura img,img.miniatura,.fotoed img,.prodsel img{cursor:zoom-in}
+#visor{position:fixed;inset:0;background:#000d;display:flex;align-items:center;justify-content:center;z-index:50}
+#visor.oculto{display:none}
+#visorImg{max-width:90vw;max-height:84vh;object-fit:contain;border-radius:6px;background:#fff}
+#visor button{position:absolute;background:#fff3;color:#fff;border:0;border-radius:50%;width:44px;height:44px;font-size:26px;cursor:pointer;line-height:40px}
+#visorX{top:14px;right:14px}
+#visorPrev{left:14px;top:50%}
+#visorNext{right:14px;top:50%}
+#visorPie{position:absolute;bottom:14px;left:0;right:0;text-align:center;color:#fff;font-size:14px}
 #catFotos{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
 .fotoed{position:relative}
 .fotoed img{width:64px;height:64px;object-fit:cover;border-radius:6px;display:block}
@@ -2777,6 +2854,7 @@ button.mini{padding:4px 10px;font-size:13px}
     <button class="oculto" id="btnAceptar" title="Tomar esta conversación: el bot deja de contestar">✋ Aceptar</button>
     <button class="sec oculto" id="btnExcel" title="Descargar el último pedido en Excel">📥 Pedido Excel</button>
     <button class="sec oculto" id="devolver">Devolver al bot</button>
+    <button class="peligro oculto" id="btnBorrarChat" title="Borrar esta conversación del panel">🗑 Borrar chat</button>
    </div>
    <div id="avisoVentana" class="oculto">⏳ Pasaron más de 24 hs desde el último mensaje del cliente: WhatsApp no deja escribirle primero. Esperá a que él escriba.</div>
    <div id="msgs"></div>
@@ -2795,6 +2873,13 @@ button.mini{padding:4px 10px;font-size:13px}
    </div>
   </div>
  </section>
+</div>
+<div id="visor" class="oculto">
+ <button type="button" id="visorX" title="Cerrar (Esc)">✕</button>
+ <button type="button" id="visorPrev" title="Anterior">‹</button>
+ <img id="visorImg" alt="">
+ <button type="button" id="visorNext" title="Siguiente">›</button>
+ <div id="visorPie"></div>
 </div>
 <div id="modal" class="oculto"><div class="caja"><div id="reporteCuerpo"></div><p><button id="cerrarModal">Cerrar</button></p></div></div>
 <div id="modalCat" class="oculto"><div class="caja">
@@ -2866,7 +2951,7 @@ const el = (tag, cls, txt) => {
 const vaciar = n => { while (n.firstChild) n.removeChild(n.firstChild); };
 const norm = s => (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
 
-let actual = null, datosLista = [], pintados = new Map(), previo = null;
+let actual = null, datosLista = [], pintados = new Map(), previo = null, esAdmin = false;
 let sonidoOn = false, audioCtx = null, ventanaAbierta = true, enviando = false, cargandoChat = false;
 try { sonidoOn = localStorage.getItem("sonido") === "1"; } catch (e) {}
 
@@ -2983,6 +3068,36 @@ function actualizarControles() {
   $("btnProd").disabled = !ventanaAbierta || enviando;
 }
 const NOMBRES = { cliente: "Cliente", bot: "Bot", vendedor: "Vendedor" };
+/* ---------- visor para ampliar imágenes ---------- */
+let visorUrls = [], visorPos = 0;
+function abrirVisor(urls, pos, titulo) {
+  visorUrls = urls.filter(Boolean);
+  if (!visorUrls.length) return;
+  visorPos = Math.max(0, Math.min(pos || 0, visorUrls.length - 1));
+  $("visor").dataset.titulo = titulo || "";
+  $("visor").classList.remove("oculto");
+  pintarVisor();
+}
+function pintarVisor() {
+  $("visorImg").src = visorUrls[visorPos];
+  const varias = visorUrls.length > 1;
+  $("visorPrev").classList.toggle("oculto", !varias);
+  $("visorNext").classList.toggle("oculto", !varias);
+  $("visorPie").textContent = ($("visor").dataset.titulo || "") + (varias ? "  (" + (visorPos + 1) + "/" + visorUrls.length + ")" : "");
+}
+function cerrarVisor() { $("visor").classList.add("oculto"); $("visorImg").removeAttribute("src"); }
+function moverVisor(d) { if (visorUrls.length > 1) { visorPos = (visorPos + d + visorUrls.length) % visorUrls.length; pintarVisor(); } }
+$("visorX").addEventListener("click", cerrarVisor);
+$("visorPrev").addEventListener("click", e => { e.stopPropagation(); moverVisor(-1); });
+$("visorNext").addEventListener("click", e => { e.stopPropagation(); moverVisor(1); });
+$("visor").addEventListener("click", e => { if (e.target === $("visor") || e.target === $("visorPie")) cerrarVisor(); });
+document.addEventListener("keydown", e => {
+  if ($("visor").classList.contains("oculto")) return;
+  if (e.key === "Escape") { cerrarVisor(); e.stopImmediatePropagation(); }  // Esc cierra solo la imagen, no la ventana de atrás
+  else if (e.key === "ArrowLeft") moverVisor(-1);
+  else if (e.key === "ArrowRight") moverVisor(1);
+}, true);
+
 function pintarMensaje(m, box) {
   const b = el("div", "msg " + m.quien);
   b.appendChild(el("span", "etq", (NOMBRES[m.quien] || m.quien) + (m.autor ? " · " + m.autor : "")));
@@ -2990,7 +3105,10 @@ function pintarMensaje(m, box) {
     if (m.tipo === "image" || m.tipo === "sticker") {
       const img = el("img", "foto");
       img.src = m.archivo; img.alt = "Imagen"; img.loading = "lazy";
-      img.addEventListener("click", () => window.open(m.archivo, "_blank", "noopener"));
+      img.addEventListener("click", () => {
+        const todas = Array.from(document.querySelectorAll("#msgs img.foto")).map(i => i.src);
+        abrirVisor(todas, todas.indexOf(img.src), "");
+      });
       b.appendChild(img);
     } else if (m.tipo === "audio") {
       const a = el("audio"); a.controls = true; a.preload = "none"; a.src = m.archivo; b.appendChild(a);
@@ -3008,6 +3126,16 @@ function pintarMensaje(m, box) {
   pie.appendChild(document.createTextNode(m.hora + " "));
   const tick = el("span", "tick");
   pie.appendChild(tick);
+  if (esAdmin) {
+    const del = el("button", "borrarmsg", "🗑"); del.type = "button"; del.title = "Borrar del panel";
+    del.addEventListener("click", async () => {
+      if (!confirm("¿Borrar este mensaje del panel?\n\nOjo: en el WhatsApp del cliente va a seguir apareciendo (WhatsApp no deja borrarlo de su celular).")) return;
+      const rr = await api("/api/mensajes/borrar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual, id: m.id }) });
+      if (rr.ok && rr.data && rr.data.ok) { b.remove(); pintados.delete(m.id); cargarLista().catch(() => {}); }
+      else toast((rr.data && rr.data.error) || "No se pudo borrar", true);
+    });
+    pie.appendChild(del);
+  }
   b.appendChild(pie);
   const err = el("div", "falla oculto");
   b.appendChild(err);
@@ -3148,8 +3276,11 @@ function pintarProdSel() {
   if (!lista.length) caja.appendChild(el("p", "suave", prodDatos.length ? "No hay productos con ese nombre." : "El catálogo está vacío."));
   lista.slice(0, 60).forEach(p => {
     const fila = el("div", "prodsel" + (p.activo ? "" : " pausado"));
-    if (p.foto) { const im = el("img", "miniatura"); im.src = p.foto; im.alt = ""; fila.appendChild(im); }
-    else fila.appendChild(el("div", "miniatura", "—"));
+    if (p.foto) {
+      const im = el("img", "miniatura"); im.src = p.foto; im.alt = ""; im.title = "Ampliar";
+      im.addEventListener("click", () => abrirVisor(p.fotos.map(f => f.url), 0, p.nombre));
+      fila.appendChild(im);
+    } else fila.appendChild(el("div", "miniatura", "—"));
     const info = el("div", "info");
     info.appendChild(el("b", "", p.nombre));
     const sub = el("div", "suave", (p.categoria || "") + (p.activo ? "" : " · ⏸ pausado"));
@@ -3182,6 +3313,17 @@ $("btnProd").addEventListener("click", async () => {
   else toast("No se pudo cargar el catálogo.", true);
 });
 $("prodBuscar").addEventListener("input", pintarProdSel);
+$("btnBorrarChat").addEventListener("click", async () => {
+  if (!actual) return;
+  if (!confirm("¿Borrar TODA esta conversación del panel?\n\nSe borran los mensajes y los pedidos de este cliente. No se puede deshacer. El cliente no se entera; si vuelve a escribir, empieza un chat nuevo.")) return;
+  const num = actual;
+  const rr = await api("/api/conversaciones/borrar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: num }) });
+  if (!(rr.ok && rr.data && rr.data.ok)) { toast((rr.data && rr.data.error) || "No se pudo borrar", true); return; }
+  actual = null; pintados = new Map(); previo = null;
+  $("panelChat").classList.add("oculto"); $("vacio").classList.remove("oculto"); $("main").classList.remove("abierto");
+  toast("Conversación borrada");
+  cargarLista().catch(() => {});
+});
 $("btnAceptar").addEventListener("click", async () => {
   if (!actual) return;
   const r = await api("/api/aceptar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual }) });
@@ -3251,7 +3393,11 @@ function pintarFotosEd() {
   fotosEd.forEach((f, i) => {
     if (quitarEd.has(f.nombre)) return;
     const d = el("div", "fotoed");
-    const im = el("img"); im.src = f.url; im.alt = "";
+    const im = el("img"); im.src = f.url; im.alt = ""; im.title = "Ampliar";
+    im.addEventListener("click", () => {
+      const vis = fotosEd.filter(g => !quitarEd.has(g.nombre));
+      abrirVisor(vis.map(g => g.url), vis.indexOf(f), $("catNombre").value);
+    });
     const x = el("button", "", "✕"); x.type = "button"; x.title = "Quitar esta foto";
     x.addEventListener("click", () => { quitarEd.add(f.nombre); pintarFotosEd(); });
     d.appendChild(im);
@@ -3281,8 +3427,11 @@ function pintarCatalogo() {
   if (!lista.length) caja.appendChild(el("p", "suave", catDatos.length ? "No hay productos con ese filtro." : "Todavía no hay productos."));
   lista.forEach(p => {
     const fila = el("div", "prodcat" + (p.activo ? "" : " pausado"));
-    if (p.foto) { const im = el("img", "miniatura"); im.src = p.foto; im.alt = ""; fila.appendChild(im); }
-    else fila.appendChild(el("div", "miniatura", "—"));
+    if (p.foto) {
+      const im = el("img", "miniatura"); im.src = p.foto; im.alt = ""; im.title = "Ampliar";
+      im.addEventListener("click", () => abrirVisor(p.fotos.map(f => f.url), 0, p.nombre));
+      fila.appendChild(im);
+    } else fila.appendChild(el("div", "miniatura", "—"));
     const info = el("div", "info");
     info.appendChild(el("b", "", p.nombre));
     const sub = el("div", "suave");
@@ -3489,7 +3638,7 @@ async function refrescarRapidas() {
 api("/api/config").then(r => {
   if (!r.ok || !r.data) return;
   $("quienSoy").textContent = "👤 " + (r.data.nombre || "");
-  if (r.data.rol === "admin") $("btnAjustes").classList.remove("oculto");
+  if (r.data.rol === "admin") { esAdmin = true; $("btnAjustes").classList.remove("oculto"); $("btnBorrarChat").classList.remove("oculto"); }
   $("modoDb").textContent = r.data.db === "supabase" ? "🟢 Datos guardados en Supabase" : "⚠️ Base temporal: se borra al reiniciar";
   pintarRapidas(r.data);
 }).catch(() => {});
