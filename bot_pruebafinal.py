@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 12: enviar Excel/Word y productos del catálogo desde el chat)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 13: fotos y archivos seguidos se contestan una sola vez)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -16,6 +16,7 @@ VARIABLES DE ENTORNO (en Render: Environment)
                    Con disco persistente de Render: /data
 
   ESPERA_JUNTAR    segundos que espera el bot por si el cliente manda varios mensajes (2.5)
+  ESPERA_ARCHIVOS  segundos que espera cuando mandan fotos/archivos seguidos, para contestar una sola vez (4)
 
 AJUSTES (⚙️ en el panel, solo el administrador)
   Horarios, dirección, medios de pago, envíos, saludo, feriados, respuestas rápidas y
@@ -137,6 +138,10 @@ try:
     ESPERA_JUNTAR = float(os.environ.get("ESPERA_JUNTAR", "2.5"))
 except ValueError:
     ESPERA_JUNTAR = 2.5
+try:
+    ESPERA_ARCHIVOS = float(os.environ.get("ESPERA_ARCHIVOS", "4"))  # espera extra cuando mandan fotos/archivos seguidos
+except ValueError:
+    ESPERA_ARCHIVOS = 4.0
 GRAPH = "https://graph.facebook.com/" + os.environ.get("GRAPH_VERSION", "v21.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1464,7 +1469,11 @@ def bot_callado(c):
     return bool(c and c["humano"] and not esperando_vendedor(c))
 
 
+_aviso_espera = {}  # numero -> hora del último "Ya avisamos"
+
+
 def avisar_espera(numero):
+    _aviso_espera[numero] = time.time()
     decir_botones(numero, "🔔 Ya avisamos a un vendedor: te responde en un momento por acá. "
                           "Mientras tanto, si querés, mirá horarios o productos 👇",
                   [("horarios", "🕒 Horarios"), ("productos", "🧱 Productos")],
@@ -1476,11 +1485,14 @@ def derivar(numero, motivo, mensaje):
     el bot sigue contestando horarios, productos, etc. (no vuelve a derivar ni dice 'no entendí')."""
     if esperando_vendedor(conv(numero)):
         evento("vendedor_repetido", motivo)
+        if motivo == "archivo" and time.time() - _aviso_espera.get(numero, 0) < 120:
+            return  # ya le dijimos "ya avisamos" hace un momento: no repetimos por cada foto
         return avisar_espera(numero)
     evento("vendedor", motivo)
     marcar(numero, humano=1, pide_vendedor=1, pide_desde=time.time(), fallos=0, atiende="")
     if not abierto_ahora():
         mensaje += "\n\n" + ajustes()["fuera_horario"]
+    _aviso_espera[numero] = time.time()  # recién le avisamos: no repetirlo por cada foto que siga mandando
     decir(numero, mensaje)
 
 
@@ -1584,18 +1596,35 @@ def responder(numero, texto, primer_mensaje):
 _pendientes = {}
 _pend_lock = threading.Lock()
 MAX_JUNTAR = 10.0  # aunque siga escribiendo, a los 10 s se le contesta
+MAX_JUNTAR_ARCHIVOS = 30.0  # con fotos/archivos seguidos damos más margen (tardan en subir)
 
 
-def encolar(numero, texto):
+def encolar(numero, texto="", archivos=0):
+    """Junta lo que el cliente manda seguido (textos y/o fotos/archivos) para contestar UNA sola vez."""
     with _pend_lock:
         p = _pendientes.get(numero)
         nuevo = p is None
         if nuevo:
-            p = _pendientes[numero] = {"textos": [], "desde": time.time(), "ultimo": 0.0}
-        p["textos"].append(texto)
+            p = _pendientes[numero] = {"textos": [], "archivos": 0, "desde": time.time(), "ultimo": 0.0}
+        if texto:
+            p["textos"].append(texto)
+        p["archivos"] += archivos
         p["ultimo"] = time.time()
     if nuevo:
         threading.Thread(target=_esperar_y_responder, args=(numero,), daemon=True).start()
+
+
+def texto_archivos(n):
+    if n <= 1:
+        return DERIVACION_ARCHIVO
+    return f"Recibí lo que me mandaste ({n} archivos) 📎. Se lo paso a un vendedor para que lo revise. 🔔"
+
+
+def responder_archivos(numero, n):
+    if DERIVAR_ARCHIVOS:
+        derivar(numero, "archivo", texto_archivos(n))
+    else:
+        decir_menu(numero, "Recibí tu archivo 🙂" if n <= 1 else f"Recibí tus {n} archivos 🙂")
 
 
 def _esperar_y_responder(numero):
@@ -1605,15 +1634,20 @@ def _esperar_y_responder(numero):
             with _pend_lock:
                 p = _pendientes[numero]
                 ahora_ts = time.time()
-                if ahora_ts - p["ultimo"] >= ESPERA_JUNTAR or ahora_ts - p["desde"] >= MAX_JUNTAR:
+                espera = max(ESPERA_JUNTAR, ESPERA_ARCHIVOS) if p["archivos"] else ESPERA_JUNTAR
+                tope = MAX_JUNTAR_ARCHIVOS if p["archivos"] else MAX_JUNTAR
+                if ahora_ts - p["ultimo"] >= espera or ahora_ts - p["desde"] >= tope:
                     del _pendientes[numero]
-                    textos = p["textos"]
+                    textos, archivos = p["textos"], p["archivos"]
                     break
         with lock_de(numero):
             c = conv(numero)
             if bot_callado(c):
                 return  # mientras tanto lo tomó un vendedor
-            responder(numero, " ".join(textos), es_primer_mensaje(numero))
+            if archivos:
+                responder_archivos(numero, archivos)  # una sola respuesta por tanda (si hubo texto, lo lee el vendedor)
+            else:
+                responder(numero, " ".join(textos), es_primer_mensaje(numero))
     except Exception:
         log.exception("Error contestando a %s", numero)
         with _pend_lock:
@@ -1713,10 +1747,10 @@ def procesar_mensaje(msg, perfil=""):
 
         if es_archivo:
             evento("archivo", tipo)
-            if DERIVAR_ARCHIVOS:
-                derivar(numero, "archivo", DERIVACION_ARCHIVO)
+            if ESPERA_JUNTAR > 0:
+                encolar(numero, "", archivos=1)  # si manda varios seguidos, se contesta una sola vez
             else:
-                decir_menu(numero, "Recibí tu archivo 🙂")
+                responder_archivos(numero, 1)
             return
         if accion:
             manejar_accion(numero, accion)  # toques de botones: se contestan al instante
