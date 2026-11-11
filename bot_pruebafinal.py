@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 14: borrar mensajes y chats, ampliar imágenes)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 15: listas de pedido, presentación del bot, mensajes cortados, corregir mensajes)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -1238,7 +1238,114 @@ NUMEROS = {"un", "uno", "una", "dos", "tres", "cuatro", "cinco", "seis", "siete"
            "once", "doce", "quince", "veinte", "treinta", "cuarenta", "cincuenta", "cien", "medio", "media",
            "docena", "varios", "varias"}
 UNIDADES = {"bolsa", "caja", "metro", "kilo", "litro", "unidad", "rollo", "par", "bidon", "lata", "m", "kg", "lt", "mt"}
+NUM_PALABRAS = {"un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7,
+                "ocho": 8, "nueve": 9, "diez": 10, "once": 11, "doce": 12, "quince": 15, "veinte": 20, "treinta": 30,
+                "cuarenta": 40, "cincuenta": 50, "cien": 100, "docena": 12}
+UNIDADES_EXTRA = {"gr", "grs", "gramo", "gramos", "g", "cc", "ml", "cm", "mm"}
+SALUDOS_SUELTOS = {"hola", "holaa", "holaaa", "ola", "buenas", "buena", "buen", "buenos", "dia", "dias", "tarde", "tardes",
+                   "noche", "noches", "hey", "hello", "que", "tal", "como", "estan", "esta", "estas", "andan", "anda",
+                   "va", "todo", "bien", "ustedes", "saludos", "los", "les", "un", "gusto"}
+SALUDOS_FUERTES = {"hola", "holaa", "holaaa", "ola", "buenas", "buenos", "buen", "hey", "hello"}
 MAX_ITEMS_PEDIDO = 30
+MAX_LINEAS_LISTA = 40
+
+
+def es_solo_saludo(t):
+    """'hola buenas tardes' -> True; 'hola, tienen cemento?' -> False (t ya normalizado)."""
+    palabras = t.split()
+    return bool(palabras) and all(w in SALUDOS_SUELTOS for w in palabras) and any(w in SALUDOS_FUERTES for w in palabras)
+
+
+def partir_cantidad(seg):
+    """'5 flexibles gris' -> ('flexibles gris', '5'); 'dos bolsas de cal' -> ('cal', '2 bolsas'); 'cemento' -> ('cemento', '')."""
+    seg = " ".join(seg.split())
+    cant, resto = "", seg
+    m = re.match(r"^(\d+(?:[.,]\d+)?)(?![/\d])\s*(.*)$", seg)
+    if m:
+        cant, resto = m.group(1).replace(",", "."), m.group(2)
+    else:
+        mw = re.match(r"^([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\s+(.+)$", seg)
+        if mw and normalizar(mw.group(1)) in NUM_PALABRAS:
+            cant, resto = str(NUM_PALABRAS[normalizar(mw.group(1))]), mw.group(2)
+    if cant:
+        mu = re.match(r"^([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\b\s*(?:de\s+)?(.*)$", resto)
+        if mu:
+            w = normalizar(mu.group(1))
+            if raiz(w) in UNIDADES or w in UNIDADES_EXTRA:
+                cant, resto = cant + " " + mu.group(1), mu.group(2)
+        resto = re.sub(r"^(?:x|de)\s+", "", resto, flags=re.I)
+    resto = resto.strip(" .,;:-")
+    if not resto:  # era solo un número: lo dejamos como nombre
+        return seg[:80], ""
+    return resto[:80], cant[:40]
+
+
+def partir_items(texto):
+    """Convierte lo que escribe el cliente en una lista de (producto, cantidad).
+    Sirve para listas con varias líneas, viñetas, punto y coma o comas ('2 cal, 3 cemento')."""
+    partes = re.split(r"[\r\n]+|;|•|·", texto or "")
+    lineas = []
+    for p in partes:
+        p = re.sub(r"(?<=\d),(?=\d)", ".", p)  # 2,5 mm -> 2.5 mm (la coma decimal no separa productos)
+        p = re.sub(r"^[\-\*–—]+\s*", "", p.strip())
+        p = re.sub(r"^\d{1,2}\s*[\)\.]\s+", "", p)  # numeración "1) cemento", "2. cal"
+        if not p:
+            continue
+        if "," in p:
+            sub = [x.strip() for x in p.split(",") if x.strip()]
+            if sum(1 for x in sub if partir_cantidad(x)[1]) >= 2:
+                lineas.extend(sub)
+                continue
+        lineas.append(p)
+    items = []
+    for p in lineas[:MAX_LINEAS_LISTA]:
+        t = normalizar(p)
+        encabezado = p.rstrip().endswith(":") or (tiene(t, PALABRAS_PRESUPUESTO) and not re.search(r"\d", t))
+        if not t or es_solo_saludo(t) or es_cierre(p) or encabezado:
+            continue
+        items.append(partir_cantidad(p))
+    # frase de presentación antes de la lista ("y materiales q hay q comprar es"): no es un producto
+    if sum(1 for _, c in items if c) >= 2:
+        while items and not items[0][1] and len(items[0][0].split()) >= 4:
+            items.pop(0)
+    return items
+
+
+def es_lista_pedido(items):
+    """Varios productos con cantidad (al menos la mitad): es un pedido, no una consulta suelta."""
+    con_cant = sum(1 for _, c in items if c)
+    return len(items) >= 2 and con_cant >= 2 and con_cant * 2 >= len(items)
+
+
+def termina_incompleto(texto):
+    """'me podría hacer un presupuesto de' -> True: seguro sigue escribiendo, esperamos más."""
+    t = (texto or "").strip()
+    if not t:
+        return False
+    if t.endswith((":", ",", "...", "…", " -")):
+        return True
+    ult = normalizar(t).split()[-1:]
+    return bool(ult) and ult[0] in {"de", "del", "con", "para", "y", "e", "o", "u", "que", "q", "los", "las", "el", "la",
+                                    "un", "una", "unos", "unas", "por", "a", "en", "mi", "su", "sin", "pero"}
+
+
+def agregar_lista(numero, items):
+    """Suma cada línea como un producto del pedido y le muestra al cliente lo que anotamos."""
+    agregados, sobran = [], 0
+    for nombre, cant in items:
+        if carrito_agregar(numero, "", nombre, cant):
+            agregados.append({"nombre": nombre, "cantidad": cant})
+            evento("pedido_item", "lista")
+        else:
+            sobran += 1
+    if not agregados:
+        decir(numero, "Tu pedido ya tiene muchos productos. Pedí el presupuesto y después seguimos 🙂")
+        return mostrar_carrito(numero)
+    mostrados = agregados[:12]
+    resumen = texto_items(mostrados) + (f"\n…y {len(agregados) - 12} más" if len(agregados) > 12 else "")
+    aviso = f"\n\n⚠️ Quedaron {sobran} sin anotar: el pedido tiene el máximo de {MAX_ITEMS_PEDIDO} productos." if sobran else ""
+    decir_botones(numero, f"✅ Anoté {len(agregados)} producto{'s' if len(agregados) != 1 else ''} en tu pedido:\n{resumen}{aviso}",
+                  BTN_AGREGADO, "Escribí *PEDIDO* para ver tu pedido o *PRESUPUESTO* para pedirlo.")
 ESPERA_VENCE = 20 * 60  # si el cliente no contesta la cantidad en 20 minutos, se olvida
 
 
@@ -1358,6 +1465,7 @@ def mostrar_carrito(numero):
 
 
 def ofrecer_armar_pedido(numero):
+    poner_espera(numero, "libre")  # lo próximo que escriba (aunque no toque el botón) se anota como su pedido
     return decir_botones(
         numero,
         "📋 ¡Claro! Para el presupuesto armá tu pedido: elegí productos del catálogo o escribí lo que "
@@ -1446,8 +1554,25 @@ def manejar_espera(numero, texto, espera):
         clave = espera[5:]
         p = buscar_producto(clave)
         nombre, cantidad = (p["nombre"] if p else clave), texto.strip()[:40]
-    else:  # "libre": un producto que todavía no está cargado en el catálogo
-        clave, nombre, cantidad = "", texto.strip()[:80], ""
+    else:  # "libre": lo que el cliente escribe es su pedido (uno o varios productos, uno por línea)
+        corto_de_consulta = (not tiene_cantidad(t) and len(t.split()) <= 4 and any(
+            tiene(t, g) for g in (PALABRAS_PEDIDO, PALABRAS_PRESUPUESTO, PALABRAS_HORARIOS, PALABRAS_DIRECCION,
+                                  PALABRAS_PAGO, PALABRAS_ENVIO, PALABRAS_PRECIO, PALABRAS_PRODUCTOS, PALABRAS_MENU)))
+        if es_solo_saludo(t) or corto_de_consulta or (("?" in texto or "¿" in texto) and not tiene_cantidad(t)):
+            marcar(numero, espera="")  # es una consulta o un saludo, no un producto
+            return False
+        items = partir_items(texto)
+        if not items:
+            if texto.strip().endswith(":") or (tiene(t, PALABRAS_PRESUPUESTO) and termina_incompleto(texto)):
+                return True  # solo encabezado ("me podrías hacer un presupuesto de:"): esperamos la lista sin molestar
+            marcar(numero, espera="")
+            return False  # algo como "presupuesto" a secas: lo atiende el flujo normal
+        
+        marcar(numero, espera="")
+        if len(items) > 1:
+            agregar_lista(numero, items)
+            return True
+        clave, (nombre, cantidad) = "", items[0]
     marcar(numero, espera="")
     if not carrito_agregar(numero, clave, nombre, cantidad):
         decir(numero, "Tu pedido ya tiene muchos productos. Pedí el presupuesto y después seguimos 🙂")
@@ -1505,6 +1630,19 @@ def responder(numero, texto, primer_mensaje):
     if es_cierre(texto):  # despedida / agradecimiento: el bot no contesta
         marcar(numero, fallos=0)
         evento("cierre")
+        return
+    intro = False
+    if primer_mensaje and not es_solo_saludo(t) and not tiene(t, PALABRAS_MENU):
+        # el cliente fue directo al grano sin saludar: nos presentamos igual (somos un bot) y seguimos
+        decir(numero, f"¡Hola! 👋 Soy el asistente virtual (un bot 🤖) de {ajustes()['nombre']}. "
+                      "Te ayudo con lo que necesites y, si hace falta, te paso con un vendedor.")
+        intro = True
+    items_lista = partir_items(texto)
+    if es_lista_pedido(items_lista) and not tiene(t, PALABRAS_VENDEDOR):
+        agregar_lista(numero, items_lista)  # una lista de productos va al pedido, no se busca palabra por palabra
+        marcar(numero, fallos=0)
+        if tiene(t, PALABRAS_PRESUPUESTO):
+            pedir_presupuesto(numero)
         return
     prods = productos_en(t)
     aclarar = []
@@ -1576,10 +1714,10 @@ def responder(numero, texto, primer_mensaje):
         if esperando_vendedor(c):
             avisar_espera(numero)
         else:
-            decir_menu(numero, saludo_texto())
+            decir_menu(numero, "¿Con qué te puedo ayudar? 👇" if intro else saludo_texto())
     elif primer_mensaje:
         evento("no_entendido", texto)  # lo anotamos, pero primero lo saludamos
-        decir_menu(numero, saludo_texto())
+        decir_menu(numero, "¿Con qué te puedo ayudar? 👇" if intro else saludo_texto())
         return
     else:
         evento("no_entendido", texto)
@@ -1597,6 +1735,11 @@ _pendientes = {}
 _pend_lock = threading.Lock()
 MAX_JUNTAR = 10.0  # aunque siga escribiendo, a los 10 s se le contesta
 MAX_JUNTAR_ARCHIVOS = 30.0  # con fotos/archivos seguidos damos más margen (tardan en subir)
+try:
+    ESPERA_INCOMPLETO = float(os.environ.get("ESPERA_INCOMPLETO", "12"))  # si el mensaje quedó cortado ("...presupuesto de")
+except ValueError:
+    ESPERA_INCOMPLETO = 12.0
+MAX_JUNTAR_INCOMPLETO = 40.0
 
 
 def encolar(numero, texto="", archivos=0):
@@ -1605,9 +1748,10 @@ def encolar(numero, texto="", archivos=0):
         p = _pendientes.get(numero)
         nuevo = p is None
         if nuevo:
-            p = _pendientes[numero] = {"textos": [], "archivos": 0, "desde": time.time(), "ultimo": 0.0}
+            p = _pendientes[numero] = {"textos": [], "archivos": 0, "desde": time.time(), "ultimo": 0.0, "incompleto": False}
         if texto:
             p["textos"].append(texto)
+            p["incompleto"] = termina_incompleto(texto)
         p["archivos"] += archivos
         p["ultimo"] = time.time()
     if nuevo:
@@ -1634,8 +1778,11 @@ def _esperar_y_responder(numero):
             with _pend_lock:
                 p = _pendientes[numero]
                 ahora_ts = time.time()
-                espera = max(ESPERA_JUNTAR, ESPERA_ARCHIVOS) if p["archivos"] else ESPERA_JUNTAR
-                tope = MAX_JUNTAR_ARCHIVOS if p["archivos"] else MAX_JUNTAR
+                espera, tope = ESPERA_JUNTAR, MAX_JUNTAR
+                if p["incompleto"]:
+                    espera, tope = max(espera, ESPERA_INCOMPLETO), max(tope, MAX_JUNTAR_INCOMPLETO)
+                if p["archivos"]:
+                    espera, tope = max(espera, ESPERA_ARCHIVOS), max(tope, MAX_JUNTAR_ARCHIVOS)
                 if ahora_ts - p["ultimo"] >= espera or ahora_ts - p["desde"] >= tope:
                     del _pendientes[numero]
                     textos, archivos = p["textos"], p["archivos"]
@@ -1647,7 +1794,7 @@ def _esperar_y_responder(numero):
             if archivos:
                 responder_archivos(numero, archivos)  # una sola respuesta por tanda (si hubo texto, lo lee el vendedor)
             else:
-                responder(numero, " ".join(textos), es_primer_mensaje(numero))
+                responder(numero, "\n".join(textos), es_primer_mensaje(numero))
     except Exception:
         log.exception("Error contestando a %s", numero)
         with _pend_lock:
@@ -2479,7 +2626,12 @@ def _celda_texto(ws, ref, valor):
 
 def _numero_de(cantidad):
     m = re.search(r"\d+(?:[.,]\d+)?", cantidad or "")
-    return float(m.group(0).replace(",", ".")) if m else None
+    if m:
+        return float(m.group(0).replace(",", "."))
+    for w in normalizar(cantidad or "").split():
+        if w in NUM_PALABRAS:
+            return float(NUM_PALABRAS[w])
+    return None
 
 
 @app.route("/api/pedidos/<numero>/excel")
@@ -2506,6 +2658,13 @@ def api_pedido_excel(numero):
         items = json.loads(fila["items"])
     except ValueError:
         items = []
+    ordenados = []
+    for it in items:  # pedidos viejos: una lista entera guardada como un solo producto -> la separamos
+        if "\n" in str(it.get("nombre", "")):
+            ordenados += [{"nombre": n, "cantidad": cant} for n, cant in partir_items(it["nombre"])] or [it]
+        else:
+            ordenados.append(it)
+    items = ordenados
     wb = Workbook()
     ws = wb.active
     ws.title = "Presupuesto"
@@ -2771,7 +2930,7 @@ button:disabled{opacity:.5;cursor:default}
 .prodsel .miniatura{width:38px;height:38px;flex:none}
 .prodsel .info{flex:1;min-width:0;font-size:14px}
 button.peligro{background:#b00020;color:#fff;border:0;border-radius:8px;padding:8px 12px;font:inherit;cursor:pointer}
-.borrarmsg{background:none;border:0;cursor:pointer;opacity:.3;font-size:12px;padding:0 2px}
+.borrarmsg{background:none;border:0;cursor:pointer;opacity:.6;font-size:13px;padding:0 3px}
 .msg:hover .borrarmsg{opacity:.9}
 .miniatura img,img.miniatura,.fotoed img,.prodsel img{cursor:zoom-in}
 #visor{position:fixed;inset:0;background:#000d;display:flex;align-items:center;justify-content:center;z-index:50}
@@ -3126,6 +3285,15 @@ function pintarMensaje(m, box) {
   pie.appendChild(document.createTextNode(m.hora + " "));
   const tick = el("span", "tick");
   pie.appendChild(tick);
+  if (m.quien === "vendedor" && m.tipo === "text" && m.texto) {
+    const ed = el("button", "borrarmsg", "✏️"); ed.type = "button";
+    ed.title = "Corregir: copia el texto al cuadro para que lo edites y lo mandes de nuevo";
+    ed.addEventListener("click", () => {
+      $("texto").value = m.texto; $("texto").focus();
+      toast("Editá el texto y apretá Enviar. Sale como mensaje nuevo: WhatsApp no permite cambiar uno ya enviado.");
+    });
+    pie.appendChild(ed);
+  }
   if (esAdmin) {
     const del = el("button", "borrarmsg", "🗑"); del.type = "button"; del.title = "Borrar del panel";
     del.addEventListener("click", async () => {
