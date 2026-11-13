@@ -1,5 +1,5 @@
 """
-Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 15: listas de pedido, presentación del bot, mensajes cortados, corregir mensajes)
+Bot de WhatsApp de la ferretería + panel web para vendedores  (versión 16: etiquetas de clientes, avisos con foto, fondo del chat)
 
 VARIABLES DE ENTORNO (en Render: Environment)
   WHATSAPP_TOKEN   token permanente de Meta                          (obligatoria)
@@ -396,6 +396,8 @@ def iniciar_db():
         _agregar_columna(con, "mensajes", "autor", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "atiende", "TEXT NOT NULL DEFAULT ''")
         _agregar_columna(con, "conversaciones", "espera", "TEXT NOT NULL DEFAULT ''")
+        _agregar_columna(con, "conversaciones", "etiquetas", "TEXT NOT NULL DEFAULT ''")  # "Arcilla|Cemento"
+        _agregar_columna(con, "conversaciones", "no_avisos", "INTEGER NOT NULL DEFAULT 0")  # 1 = pidió no recibir avisos
         con.execute("DELETE FROM vistos WHERE ts < ?", (time.time() - 3 * 86400,))
         con.execute("DELETE FROM carrito WHERE ts < ?", (time.time() - 7 * 86400,))
     log.info("Base de datos lista (%s)", "Supabase" if USA_PG else DB_PATH)
@@ -1838,6 +1840,133 @@ def bajar_media(media_id, nombre_original=""):
         return ""
 
 
+# =====================================================================
+# 7b) ETIQUETAS DE CLIENTES Y AVISOS
+# =====================================================================
+MAX_ETIQUETAS = 10
+FRASES_BAJA = {"baja", "stop", "no mas avisos", "no quiero mas avisos", "no quiero recibir avisos",
+               "no quiero avisos", "dar de baja", "darme de baja", "no me avisen mas"}
+TEXTO_BAJA = "Listo 👍 No te mandamos más avisos. Si querés algo, escribinos cuando quieras."
+PIE_AVISO = "\n\n(Para no recibir más avisos, respondé BAJA)"
+AVISO_MAX = int(os.environ.get("AVISO_MAX", "200"))        # tope de clientes por aviso (cuida la cuenta de WhatsApp)
+AVISO_PAUSA = float(os.environ.get("AVISO_PAUSA", "0.6"))  # segundos entre un mensaje y otro
+
+
+def limpiar_etiqueta(t):
+    return " ".join(str(t or "").replace("|", " ").replace(",", " ").split())[:24]
+
+
+def etiquetas_de(c):
+    return [x for x in (c["etiquetas"] or "").split("|") if x]
+
+
+def tiene_etiqueta(c, etiqueta):
+    n = normalizar(etiqueta)
+    return any(normalizar(x) == n for x in etiquetas_de(c))
+
+
+def poner_etiqueta(numero, etiqueta):
+    etiqueta = limpiar_etiqueta(etiqueta)
+    if not etiqueta:
+        return False
+    c = conv(numero)
+    if c is None:
+        return False
+    lista = etiquetas_de(c)
+    if any(normalizar(x) == normalizar(etiqueta) for x in lista) or len(lista) >= MAX_ETIQUETAS:
+        return False
+    lista.append(etiqueta)
+    marcar(numero, etiquetas="|".join(lista))
+    return True
+
+
+def quitar_etiqueta(numero, etiqueta):
+    c = conv(numero)
+    if c is None:
+        return False
+    n = normalizar(etiqueta)
+    lista = [x for x in etiquetas_de(c) if normalizar(x) != n]
+    marcar(numero, etiquetas="|".join(lista))
+    return True
+
+
+def productos_nombrados(texto):
+    """Productos (activos o pausados) que el cliente nombró, completos o a medias ('arcilla' para 'Arcilla expandida')."""
+    t = normalizar(texto)
+    if not t:
+        return []
+    hallados = {p["clave"]: p for p in productos_en(t) + productos_en(t, pausados=True)}
+    if hallados:
+        return list(hallados.values())  # nombró uno completo: no sumamos los parecidos
+    f = formas(t)
+    for p in catalogo_todo():
+        claves = {w for term in p["terms"] for w in palabras_clave(term) if len(w) >= 4}
+        if claves & f:
+            hallados.setdefault(p["clave"], p)
+    return list(hallados.values())
+
+
+def auto_etiquetar(numero, texto):
+    """Si el cliente nombra un producto del catálogo, queda anotado como interesado en ese producto."""
+    try:
+        for p in productos_nombrados(texto)[:3]:
+            poner_etiqueta(numero, p["nombre"])
+    except Exception:
+        log.exception("No se pudo etiquetar")
+
+
+def clientes_con_etiqueta(etiqueta):
+    """Clasifica a los clientes con esa etiqueta: reciben ahora / fuera de las 24 hs / dados de baja."""
+    with tx() as con:
+        filas = con.execute("SELECT * FROM conversaciones").fetchall()
+    ok, fuera, baja = [], [], []
+    for c in filas:
+        if not tiene_etiqueta(c, etiqueta):
+            continue
+        if c["no_avisos"]:
+            baja.append(c["numero"])
+        elif ventana_abierta(c):
+            ok.append(c["numero"])
+        else:
+            fuera.append(c["numero"])
+    return ok, fuera, baja
+
+
+_aviso = {"corriendo": False, "total": 0, "enviados": 0, "fallidos": 0, "etiqueta": "", "hilo": None}
+_aviso_lock = threading.Lock()
+
+
+def _enviar_aviso(numeros, texto, prod, autor):
+    caption = (texto + PIE_AVISO)[:1024]
+    try:
+        for i, numero in enumerate(numeros):
+            c = conv(numero)
+            if c is None or c["no_avisos"] or not ventana_abierta(c):
+                _aviso["fallidos"] += 1
+                continue
+            try:
+                if prod and prod.get("foto"):
+                    ok, wamid, error = enviar_foto(numero, prod["origen"], prod["foto"], caption)
+                    tipo, arch = "image", f"{prod['origen']}/{prod['foto']}"
+                else:
+                    ok, wamid, error = enviar_texto(numero, caption)
+                    tipo, arch = "text", ""
+                if ok:
+                    registrar(numero, "vendedor", tipo, caption, archivo=arch, wamid=wamid, estado="sent", autor="📣 Aviso · " + autor)
+                    _aviso["enviados"] += 1
+                else:
+                    log.warning("Aviso a %s no salió: %s", numero[-4:], error)
+                    _aviso["fallidos"] += 1
+            except Exception:
+                log.exception("Error mandando un aviso")
+                _aviso["fallidos"] += 1
+            if AVISO_PAUSA > 0 and i < len(numeros) - 1:
+                time.sleep(AVISO_PAUSA)
+    finally:
+        _aviso["corriendo"] = False
+        evento("aviso_enviado", f"{_aviso['etiqueta']}: {_aviso['enviados']} ok, {_aviso['fallidos']} fallidos")
+
+
 def procesar_mensaje(msg, perfil=""):
     numero = str(msg.get("from", ""))
     wamid = msg.get("id", "")
@@ -1888,6 +2017,15 @@ def procesar_mensaje(msg, perfil=""):
         registrar(numero, "cliente", tipo_guardado, texto, archivo=archivo, nombre_archivo=nombre_archivo)
         if perfil:
             marcar(numero, perfil=perfil[:60])
+
+        if tipo in ("text", "interactive") and normalizar(texto) in FRASES_BAJA:
+            marcar(numero, no_avisos=1)
+            ok_b, wamid_b, _ = enviar_texto(numero, TEXTO_BAJA)
+            registrar(numero, "bot", "text", TEXTO_BAJA, wamid=wamid_b, estado="sent" if ok_b else "")
+            evento("baja_avisos")
+            return
+        if tipo in ("text", "interactive") and texto:
+            auto_etiquetar(numero, texto)
 
         if bot_callado(conv(numero)):
             return  # ya lo atiende una persona: el bot se queda callado
@@ -2161,6 +2299,7 @@ def api_conversaciones():
         "pide_vendedor": bool(c["pide_vendedor"]),
         "atiende": c["atiende"],
         "espera_min": int((ahora_ts - c["pide_desde"]) // 60) if c["pide_vendedor"] else 0,
+        "etiquetas": etiquetas_de(c),
     } for c in filas])
 
 
@@ -2187,6 +2326,8 @@ def api_conversacion(numero):
         "pide_vendedor": bool(c["pide_vendedor"]),
         "atiende": c["atiende"],
         "ventana": ventana_abierta(c),
+        "etiquetas": etiquetas_de(c),
+        "no_avisos": bool(c["no_avisos"]),
         "pedidos": n_pedidos,
         "mensajes": [{
             "id": m["id"], "quien": m["quien"], "tipo": m["tipo"], "texto": m["texto"],
@@ -2234,6 +2375,89 @@ def api_enviar():
     registrar(numero, "vendedor", "text", texto, wamid=wamid, estado="sent", autor=quien())
     _despues_de_enviar(numero)
     return jsonify({"ok": True})
+
+
+@app.route("/api/etiquetas")
+@requiere_login
+def api_etiquetas():
+    """Todas las etiquetas en uso, con cuántos clientes tiene cada una y cuántos pueden recibir un aviso ahora."""
+    with tx() as con:
+        filas = con.execute("SELECT * FROM conversaciones").fetchall()
+    cuenta = {}
+    for c in filas:
+        for e in etiquetas_de(c):
+            d = cuenta.setdefault(normalizar(e), {"etiqueta": e, "total": 0, "ahora": 0})
+            d["total"] += 1
+            if not c["no_avisos"] and ventana_abierta(c):
+                d["ahora"] += 1
+    return jsonify(sorted(cuenta.values(), key=lambda d: (-d["total"], d["etiqueta"].lower())))
+
+
+@app.route("/api/etiquetas", methods=["POST"])
+@requiere_login
+def api_etiquetas_editar():
+    datos = request.get_json(silent=True) or {}
+    numero = str(datos.get("numero", ""))
+    if not numero_valido(numero) or conv(numero) is None:
+        return jsonify({"ok": False, "error": "La conversación no existe"}), 404
+    if datos.get("quitar"):
+        quitar_etiqueta(numero, str(datos["quitar"]))
+    if datos.get("agregar"):
+        if not limpiar_etiqueta(datos["agregar"]):
+            return jsonify({"ok": False, "error": "Escribí la etiqueta"}), 400
+        if not poner_etiqueta(numero, datos["agregar"]):
+            c = conv(numero)
+            if len(etiquetas_de(c)) >= MAX_ETIQUETAS:
+                return jsonify({"ok": False, "error": f"Máximo {MAX_ETIQUETAS} etiquetas por cliente"}), 400
+    return jsonify({"ok": True, "etiquetas": etiquetas_de(conv(numero))})
+
+
+@app.route("/api/avisos/destinatarios")
+@requiere_admin
+def api_avisos_destinatarios():
+    et = limpiar_etiqueta(request.args.get("etiqueta", ""))
+    if not et:
+        return jsonify({"ok": False, "error": "Elegí una etiqueta"}), 400
+    ok, fuera, baja = clientes_con_etiqueta(et)
+    return jsonify({"ok": True, "ahora": len(ok), "fuera": len(fuera), "baja": len(baja), "tope": AVISO_MAX})
+
+
+@app.route("/api/avisos/estado")
+@requiere_admin
+def api_avisos_estado():
+    return jsonify({k: _aviso[k] for k in ("corriendo", "total", "enviados", "fallidos", "etiqueta")})
+
+
+@app.route("/api/avisos", methods=["POST"])
+@requiere_admin
+def api_avisos():
+    """Manda un aviso (texto + foto de un producto) a los clientes con una etiqueta que escribieron en las últimas 24 hs."""
+    datos = request.get_json(silent=True) or {}
+    et = limpiar_etiqueta(datos.get("etiqueta", ""))
+    texto = str(datos.get("texto", "")).strip()
+    clave = str(datos.get("clave", ""))
+    if not et or not texto:
+        return jsonify({"ok": False, "error": "Falta la etiqueta o el mensaje"}), 400
+    if len(texto) > 900:
+        return jsonify({"ok": False, "error": "Mensaje demasiado largo (máximo 900 letras)"}), 400
+    prod = None
+    if clave:
+        prod = next((x for x in catalogo_todo(True) if x["clave"] == clave), None)
+        if prod is None:
+            return jsonify({"ok": False, "error": "No encontré ese producto."}), 404
+    ok, fuera, baja = clientes_con_etiqueta(et)
+    if not ok:
+        return jsonify({"ok": False, "error": "Ningún cliente con esa etiqueta puede recibir un aviso ahora "
+                        f"({len(fuera)} pasaron las 24 hs y {len(baja)} pidieron no recibir avisos)."}), 409
+    with _aviso_lock:
+        if _aviso["corriendo"]:
+            return jsonify({"ok": False, "error": "Ya hay un aviso saliendo. Esperá a que termine."}), 409
+        destinos = ok[:AVISO_MAX]
+        _aviso.update(corriendo=True, total=len(destinos), enviados=0, fallidos=0, etiqueta=et)
+        hilo = threading.Thread(target=_enviar_aviso, args=(destinos, texto, prod, quien()), daemon=True)
+        _aviso["hilo"] = hilo
+        hilo.start()
+    return jsonify({"ok": True, "enviando": len(destinos), "recortado": len(ok) > len(destinos), "fuera": len(fuera), "baja": len(baja)})
 
 
 OFFICE_MODERNO = (  # carpeta interna del .zip -> (extensión, tipo MIME)
@@ -2613,7 +2837,13 @@ def api_catalogo_activo():
         else:
             con.execute("UPDATE productos SET activo=?, oculto=0, ts=? WHERE clave=?", (activo, time.time(), clave))
     catalogo_actual(True)
-    return jsonify({"ok": True, "activo": bool(activo)})
+    interesados, nombre = 0, ""
+    if activo:
+        prod = next((x for x in catalogo_todo() if x["clave"] == clave), None)
+        if prod:
+            nombre = limpiar_etiqueta(prod["nombre"])
+            interesados = len(clientes_con_etiqueta(nombre)[0])
+    return jsonify({"ok": True, "activo": bool(activo), "interesados": interesados, "etiqueta": nombre})
 
 
 def _celda_texto(ws, ref, valor):
@@ -2902,7 +3132,7 @@ button:disabled{opacity:.5;cursor:default}
 #inputNombre{padding:5px 8px;border:1px solid #ccc;border-radius:6px;font-size:13px;width:150px}
 #estado{margin-left:auto;font-size:13px;color:var(--gris)}
 #avisoVentana{background:#fff3cd;color:#664d03;padding:8px 12px;font-size:13px;border-bottom:1px solid #ffe69c}
-#msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
+#msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px;background-color:#efeae2;background-size:cover;background-position:center;background-attachment:local}
 .msg{max-width:78%;padding:7px 10px;border-radius:8px;box-shadow:0 1px 1px #0002;overflow-wrap:anywhere}
 .msg .cuerpo{white-space:pre-wrap}
 .etq{font-size:11px;font-weight:600;color:#555;display:block;margin-bottom:2px}
@@ -2958,7 +3188,7 @@ a.archivo{display:inline-block;padding:6px 10px;background:var(--verde);color:#f
 .adjuntar{cursor:pointer;font-size:22px;padding:0 6px;display:flex;align-items:center}
 #toast{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);background:#323232;color:#fff;padding:10px 16px;border-radius:8px;max-width:90vw;z-index:20;font-size:14px}
 #toast.malo{background:#b00020}
-#modal,#modalCat{position:fixed;inset:0;background:#0008;display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
+#modal,#modalCat,#modalAv,#modalFondo{position:fixed;inset:0;background:#0008;display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
 .caja{background:#fff;border-radius:10px;max-width:520px;width:100%;max-height:90vh;overflow-y:auto;padding:18px}
 .caja h2{margin:0 0 6px}
 .caja h3{margin:16px 0 4px;font-size:15px}
@@ -2983,12 +3213,28 @@ button.mini{padding:4px 10px;font-size:13px}
  #inputNombre{width:110px}
  .msg{max-width:90%}
 }
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+.chip{display:inline-block;background:#e7f3ef;color:#075e54;border-radius:10px;padding:1px 8px;font-size:11px}
+#etqFila{background:#f7f8fa;padding:5px 12px;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--borde);flex-wrap:wrap;font-size:13px}
+#etqFila .chip{font-size:12px;padding:2px 8px}
+#etqFila .chip button{background:none;border:0;color:#075e54;padding:0 0 0 4px;cursor:pointer;font-size:12px}
+#etqNueva{padding:3px 8px;border:1px solid #ccc;border-radius:10px;font:inherit;font-size:12px;width:130px}
+.cuentas{background:#f0f2f5;border-radius:8px;padding:8px 10px;font-size:14px;margin:8px 0}
+.btnarchivo{padding:8px 14px;border-radius:8px;background:#667781;color:#fff;cursor:pointer;display:inline-block}
+.fondos{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}
+.fondo-op{width:64px;height:64px;border-radius:10px;border:2px solid #ccc;cursor:pointer;padding:0;background-size:cover}
+.fondo-op.sel{border-color:#075e54;box-shadow:0 0 0 2px #075e5455}
+#avCampos{display:flex;flex-direction:column;gap:8px}
+#avCampos select,#avCampos textarea{padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit;width:100%}
+#avCampos textarea{height:110px;resize:vertical}
 </style></head><body>
 <header>
  <strong>📋 Panel de la ferretería</strong> <span class="modo" id="modoDb"></span> <span class="modo" id="quienSoy"></span>
  <span class="der">
   <button class="ghost" id="btnSonido">🔕 Sonido: no</button>
   <button class="ghost oculto" id="btnAjustes">⚙️ Ajustes</button>
+  <button class="ghost oculto" id="btnAvisos" title="Mandar un aviso con foto a los clientes con una etiqueta">📣 Avisar</button>
+  <button class="ghost" id="btnFondo" title="Cambiar el fondo del chat">🎨 Fondo</button>
   <button class="ghost" id="btnCatalogo">📦 Catálogo</button>
   <button class="ghost" id="btnReporte">📊 Reporte</button>
   <a href="/salir">Salir</a>
@@ -2997,7 +3243,7 @@ button.mini{padding:4px 10px;font-size:13px}
 <div id="main">
  <aside id="colLista">
   <div class="filtros">
-   <input type="search" id="buscar" placeholder="Buscar por nombre o número...">
+   <input type="search" id="buscar" placeholder="Buscar por nombre, número o etiqueta...">
    <label class="chk"><input type="checkbox" id="soloPend"> Solo los que esperan vendedor <span id="cuentaPend"></span></label>
   </div>
   <div id="lista"></div>
@@ -3014,6 +3260,12 @@ button.mini{padding:4px 10px;font-size:13px}
     <button class="sec oculto" id="btnExcel" title="Descargar el último pedido en Excel">📥 Pedido Excel</button>
     <button class="sec oculto" id="devolver">Devolver al bot</button>
     <button class="peligro oculto" id="btnBorrarChat" title="Borrar esta conversación del panel">🗑 Borrar chat</button>
+   </div>
+   <div id="etqFila">
+    <span>🏷</span><span id="etqChips"></span>
+    <input type="text" id="etqNueva" list="etqLista" placeholder="+ etiqueta (Enter)" maxlength="24" autocomplete="off">
+    <datalist id="etqLista"></datalist>
+    <span id="avisoBaja" class="suave oculto">🚫 Pidió no recibir avisos</span>
    </div>
    <div id="avisoVentana" class="oculto">⏳ Pasaron más de 24 hs desde el último mensaje del cliente: WhatsApp no deja escribirle primero. Esperá a que él escriba.</div>
    <div id="msgs"></div>
@@ -3063,6 +3315,31 @@ button.mini{padding:4px 10px;font-size:13px}
   <button id="catGuardar">Guardar producto</button>
  </div>
  <p><button class="sec" id="cerrarCat">Cerrar</button></p>
+</div></div>
+<div id="modalAv" class="oculto"><div class="caja">
+ <h2>📣 Avisar a clientes</h2>
+ <p class="suave">Mandá un aviso con la foto de un producto a los clientes que preguntaron por él (o por la etiqueta que elijas).</p>
+ <div id="avCampos">
+  <label for="avEtiqueta">¿A quiénes? (etiqueta)</label>
+  <select id="avEtiqueta"></select>
+  <div id="avCuentas" class="cuentas"></div>
+  <label for="avProducto">Foto del producto (opcional)</label>
+  <select id="avProducto"><option value="">Sin foto, solo texto</option></select>
+  <label for="avTexto">Mensaje (no pongas precios)</label>
+  <textarea id="avTexto" maxlength="900"></textarea>
+  <div class="suave">Al final se agrega solo: «Para no recibir más avisos, respondé BAJA».</div>
+ </div>
+ <p class="suave">WhatsApp solo deja escribirle primero a quien te escribió en las últimas 24 hs. A los demás no les llega: para eso hace falta una plantilla aprobada por Meta.</p>
+ <div class="acciones"><button id="avEnviar">📣 Enviar aviso</button><button class="sec" id="avCerrar">Cerrar</button></div>
+ <div id="avEstado" class="suave"></div>
+</div></div>
+<div id="modalFondo" class="oculto"><div class="caja">
+ <h2>🎨 Fondo del chat</h2>
+ <p class="suave">Se guarda en este navegador (cada vendedor elige el suyo).</p>
+ <div class="fondos" id="fondoOpciones"></div>
+ <p><label class="btnarchivo">🖼 Usar mi foto<input type="file" id="fondoArchivo" accept="image/png,image/jpeg" class="oculto"></label>
+ <button class="sec" id="fondoQuitar">Volver al fondo original</button></p>
+ <p><button class="sec" id="fondoCerrar">Cerrar</button></p>
 </div></div>
 <div id="modalAj" class="oculto"><div class="caja ancha">
  <h2>⚙️ Ajustes del bot</h2>
@@ -3185,7 +3462,7 @@ function pintarLista() {
   const solo = $("soloPend").checked;
   const caja = $("lista");
   vaciar(caja);
-  const filas = datosLista.filter(c => (!solo || c.pide_vendedor) && (!q || norm(c.titulo + " " + c.numero).includes(q)));
+  const filas = datosLista.filter(c => (!solo || c.pide_vendedor) && (!q || norm(c.titulo + " " + c.numero + " " + (c.etiquetas || []).join(" ")).includes(q)));
   if (!filas.length) {
     caja.appendChild(el("div", "vacio", datosLista.length ? "No hay resultados." : "Todavía no hay mensajes."));
     return;
@@ -3202,6 +3479,11 @@ function pintarLista() {
     if (c.pide_vendedor) marca = "🔔 Espera" + (c.espera_min ? " hace " + c.espera_min + " min" : "") + " · ";
     else if (c.humano) marca = "👤 " + (c.atiende ? c.atiende + ": " : "");
     item.appendChild(el("div", "prev", marca + c.texto));
+    if (c.etiquetas && c.etiquetas.length) {
+      const ch = el("div", "chips");
+      c.etiquetas.slice(0, 4).forEach(e => ch.appendChild(el("span", "chip", e)));
+      item.appendChild(ch);
+    }
     item.addEventListener("click", () => abrir(c.numero));
     caja.appendChild(item);
   });
@@ -3345,6 +3627,8 @@ async function cargarChat(bajar) {
     $("btnAceptar").classList.toggle("oculto", !(d.humano && d.pide_vendedor));
     $("devolver").classList.toggle("oculto", !d.humano);
     $("btnExcel").classList.toggle("oculto", !d.pedidos);
+    pintarEtiquetas(d.etiquetas || [], num);
+    $("avisoBaja").classList.toggle("oculto", !d.no_avisos);
     ventanaAbierta = d.ventana;
     $("avisoVentana").classList.toggle("oculto", d.ventana);
     actualizarControles();
@@ -3621,6 +3905,11 @@ function pintarCatalogo() {
     pa.addEventListener("click", async () => {
       const rr = await api("/api/catalogo/activo", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clave: p.clave, activo: !p.activo }) });
       if (!(rr.ok && rr.data && rr.data.ok)) toast((rr.data && rr.data.error) || "No se pudo cambiar", true);
+      else if (rr.data.interesados > 0 && esAdmin && confirm("Hay " + rr.data.interesados + " cliente(s) que preguntaron por " + p.nombre + " y pueden recibir un aviso ahora.\n\n¿Querés avisarles que ya lo tenés?")) {
+        $("modalCat").classList.add("oculto");
+        $("avTexto").value = "";
+        abrirAvisos(rr.data.etiqueta, p.clave).catch(() => {});
+      }
       cargarCatalogo().catch(() => {});
     });
     const bo = el("button", "sec mini", "Borrar");
@@ -3802,11 +4091,158 @@ async function refrescarRapidas() {
   if (r.ok && r.data) pintarRapidas(r.data);
 }
 
+
+/* ---------- etiquetas de clientes ---------- */
+let etqActuales = "";
+function pintarEtiquetas(lista, num) {
+  const clave = num + "|" + lista.join("|");
+  if (clave === etqActuales) return;
+  etqActuales = clave;
+  const caja = $("etqChips");
+  vaciar(caja);
+  lista.forEach(e => {
+    const c = el("span", "chip", e);
+    const x = el("button", "", "✕"); x.type = "button"; x.title = "Quitar etiqueta";
+    x.addEventListener("click", async () => {
+      const r = await api("/api/etiquetas", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual, quitar: e }) });
+      if (r.ok && r.data && r.data.ok) { etqActuales = ""; cargarChat(false).catch(() => {}); cargarLista().catch(() => {}); }
+    });
+    c.appendChild(x);
+    caja.appendChild(c);
+  });
+}
+async function cargarSugerenciasEtq() {
+  const r = await api("/api/etiquetas");
+  if (!r.ok || !Array.isArray(r.data)) return [];
+  const dl = $("etqLista"); vaciar(dl);
+  r.data.forEach(d => { const o = el("option"); o.value = d.etiqueta; dl.appendChild(o); });
+  return r.data;
+}
+$("etqNueva").addEventListener("focus", () => { cargarSugerenciasEtq().catch(() => {}); });
+$("etqNueva").addEventListener("keydown", async e => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  const v = $("etqNueva").value.trim();
+  if (!v || !actual) return;
+  const r = await api("/api/etiquetas", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ numero: actual, agregar: v }) });
+  if (r.ok && r.data && r.data.ok) { $("etqNueva").value = ""; etqActuales = ""; cargarChat(false).catch(() => {}); cargarLista().catch(() => {}); }
+  else toast((r.data && r.data.error) || "No se pudo agregar", true);
+});
+
+/* ---------- avisos a clientes ---------- */
+let avTimer = null;
+async function avContar() {
+  const et = $("avEtiqueta").value;
+  const caja = $("avCuentas"); vaciar(caja);
+  if (!et) { caja.textContent = "Todavía no hay clientes etiquetados."; return; }
+  const r = await api("/api/avisos/destinatarios?etiqueta=" + encodeURIComponent(et));
+  if (!(r.ok && r.data && r.data.ok)) { caja.textContent = "No se pudo contar."; return; }
+  const d = r.data;
+  caja.appendChild(el("div", "", "✅ Les llega ahora: " + d.ahora + (d.ahora > d.tope ? " (se mandan los primeros " + d.tope + ")" : "")));
+  caja.appendChild(el("div", "suave", "⏳ Pasaron 24 hs (no les llega): " + d.fuera));
+  if (d.baja) caja.appendChild(el("div", "suave", "🚫 Pidieron no recibir avisos: " + d.baja));
+}
+async function abrirAvisos(etiqueta, clave) {
+  $("modalAv").classList.remove("oculto");
+  vaciar($("avEstado"));
+  const [tags, cat] = await Promise.all([api("/api/etiquetas"), api("/api/catalogo")]);
+  const sel = $("avEtiqueta"); vaciar(sel);
+  (tags.ok && Array.isArray(tags.data) ? tags.data : []).forEach(d => {
+    const o = el("option", "", d.etiqueta + " (" + d.total + " clientes · " + d.ahora + " ahora)");
+    o.value = d.etiqueta; sel.appendChild(o);
+  });
+  if (etiqueta) sel.value = etiqueta;
+  const ps = $("avProducto"); vaciar(ps);
+  const o0 = el("option", "", "Sin foto, solo texto"); o0.value = ""; ps.appendChild(o0);
+  (cat.ok && Array.isArray(cat.data) ? cat.data : []).filter(p => p.activo).forEach(p => {
+    const o = el("option", "", p.nombre); o.value = p.clave; ps.appendChild(o);
+  });
+  if (clave) ps.value = clave;
+  else if (sel.value) { const o = Array.from(ps.options).find(x => norm(x.textContent) === norm(sel.value)); if (o) ps.value = o.value; }
+  if (!$("avTexto").value.trim() || etiqueta) {
+    const nom = ps.selectedOptions[0] && ps.value ? ps.selectedOptions[0].textContent : (etiqueta || "ese producto");
+    $("avTexto").value = "¡Hola! 👋 Te avisamos que ya tenemos " + nom + ". Si querés, te armamos el presupuesto 😉";
+  }
+  avContar().catch(() => {});
+}
+$("btnAvisos").addEventListener("click", () => abrirAvisos().catch(() => {}));
+$("avEtiqueta").addEventListener("change", () => {
+  const o = Array.from($("avProducto").options).find(x => norm(x.textContent) === norm($("avEtiqueta").value));
+  if (o) $("avProducto").value = o.value;
+  avContar().catch(() => {});
+});
+$("avCerrar").addEventListener("click", () => { $("modalAv").classList.add("oculto"); clearInterval(avTimer); });
+async function avSeguir() {
+  const r = await api("/api/avisos/estado");
+  if (!(r.ok && r.data)) return;
+  const d = r.data, e = $("avEstado");
+  e.textContent = d.corriendo ? "Enviando… " + d.enviados + " de " + d.total
+    : "Listo: " + d.enviados + " enviados" + (d.fallidos ? " · " + d.fallidos + " no salieron" : "") + ".";
+  if (!d.corriendo) { clearInterval(avTimer); $("avEnviar").disabled = false; cargarLista().catch(() => {}); }
+}
+$("avEnviar").addEventListener("click", async () => {
+  const et = $("avEtiqueta").value, texto = $("avTexto").value.trim();
+  if (!et || !texto) { toast("Elegí la etiqueta y escribí el mensaje", true); return; }
+  if (!confirm("¿Mandar este aviso a los clientes con la etiqueta «" + et + "» que pueden recibirlo ahora?\n\nNo se puede deshacer.")) return;
+  $("avEnviar").disabled = true;
+  const r = await api("/api/avisos", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ etiqueta: et, texto, clave: $("avProducto").value }) });
+  if (!(r.ok && r.data && r.data.ok)) { $("avEnviar").disabled = false; toast((r.data && r.data.error) || "No se pudo enviar", true); return; }
+  $("avEstado").textContent = "Enviando… 0 de " + r.data.enviando;
+  clearInterval(avTimer); avTimer = setInterval(() => avSeguir().catch(() => {}), 1500);
+});
+
+/* ---------- fondo del chat ---------- */
+const FONDOS = [
+  ["Original", "#efeae2"], ["Verde suave", "#d9f0e3"], ["Celeste", "#dbeafe"], ["Rosa", "#fde4ec"],
+  ["Gris", "#e5e7eb"], ["Arena", "#f5e6c8"], ["Blanco", "#ffffff"], ["Oscuro", "#0b141a"]
+];
+function aplicarFondo(f) {
+  const m = $("msgs");
+  m.style.backgroundImage = "none";
+  m.style.backgroundColor = "#efeae2";
+  if (f && f.tipo === "color") m.style.backgroundColor = f.v;
+  else if (f && f.tipo === "img" && /^data:image\/(jpeg|png);base64,/.test(f.v)) { m.style.backgroundImage = "url(" + f.v + ")"; }
+  document.querySelectorAll(".fondo-op").forEach(b => b.classList.toggle("sel", !!f && f.tipo === "color" && b.dataset.v === f.v));
+}
+function leerFondo() { try { return JSON.parse(localStorage.getItem("fondo") || "null"); } catch (e) { return null; } }
+function guardarFondo(f) {
+  try { if (f) localStorage.setItem("fondo", JSON.stringify(f)); else localStorage.removeItem("fondo"); return true; }
+  catch (e) { toast("Este navegador no deja guardar el fondo (queda hasta que cierres la página).", true); return false; }
+}
+FONDOS.forEach(([nombre, color]) => {
+  const b = el("button", "fondo-op"); b.type = "button"; b.title = nombre; b.dataset.v = color;
+  b.style.backgroundColor = color;
+  b.addEventListener("click", () => { const f = { tipo: "color", v: color }; aplicarFondo(f); guardarFondo(f); });
+  $("fondoOpciones").appendChild(b);
+});
+$("btnFondo").addEventListener("click", () => { $("modalFondo").classList.remove("oculto"); aplicarFondo(leerFondo()); });
+$("fondoCerrar").addEventListener("click", () => $("modalFondo").classList.add("oculto"));
+$("fondoQuitar").addEventListener("click", () => { guardarFondo(null); aplicarFondo(null); });
+$("fondoArchivo").addEventListener("change", ev => {
+  const arch = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (!arch) return;
+  const url = URL.createObjectURL(arch);
+  const img = new Image();
+  img.onload = () => {
+    const k = Math.min(1, 1280 / Math.max(img.width, img.height));
+    const cv = document.createElement("canvas");
+    cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k);
+    cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+    URL.revokeObjectURL(url);
+    const f = { tipo: "img", v: cv.toDataURL("image/jpeg", 0.7) };
+    aplicarFondo(f); guardarFondo(f);
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); toast("No pude leer esa imagen.", true); };
+  img.src = url;
+});
+aplicarFondo(leerFondo());
+
 /* ---------- arranque ---------- */
 api("/api/config").then(r => {
   if (!r.ok || !r.data) return;
   $("quienSoy").textContent = "👤 " + (r.data.nombre || "");
-  if (r.data.rol === "admin") { esAdmin = true; $("btnAjustes").classList.remove("oculto"); $("btnBorrarChat").classList.remove("oculto"); }
+  if (r.data.rol === "admin") { esAdmin = true; $("btnAjustes").classList.remove("oculto"); $("btnAvisos").classList.remove("oculto"); $("btnBorrarChat").classList.remove("oculto"); }
   $("modoDb").textContent = r.data.db === "supabase" ? "🟢 Datos guardados en Supabase" : "⚠️ Base temporal: se borra al reiniciar";
   pintarRapidas(r.data);
 }).catch(() => {});
